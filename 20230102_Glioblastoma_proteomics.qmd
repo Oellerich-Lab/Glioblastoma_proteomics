@@ -1,0 +1,790 @@
+---
+title: "20230102_Glioblastoma_proteomics"
+format: 
+  html : 
+    code-fold: true
+editor: visual
+date: "`r Sys.Date()`"
+knitr:
+  opts_chunk:
+    message: false
+    warning: false
+---
+
+## Introduction
+
+Global proteome expression data was generated from primary FFPE glioblastoma samples by Andrea Di Fonzo PhD using a TMT-10-plex approach. Here, one label/channel per plex served as a reference-channel that was later used for the inter-plex normalization. The below generated report for the normalization is also available in the public github repository within the Oellerich Lab github: <https://github.com/Oellerich-Lab/Glioblastoma_proteomics>
+
+## Methods
+
+To perform normalization on the generated global proteome expression data, the internal-reference-scaling method (IRS) was used. In brief, this method initially corrects for sample loading differences within each plex and in a second step uses the present reference samples/channels that are the same across all plexes for normalization between all plexes. A good tutorial and theoretical summary for applying this method can be found here: <https://pwilmart.github.io/IRS_normalization/>.
+
+## Report
+
+### Setup
+
+```{r}
+library(tidyverse)
+library(cowplot)
+```
+
+First, load the meta data provided by Andrea di Fonzo and inspect the top of the data.
+
+```{r}
+df_meta <- readxl::read_excel("Samples-List_Labellin_221205 (1).xlsx", sheet = 2) %>%
+  janitor::clean_names()
+
+head(df_meta)
+```
+
+Second, load the raw data and inspect the top of the data
+
+```{r}
+df_prot <- readxl::read_excel("~/Library/CloudStorage/OneDrive-JohannWolfgangGoetheUniversität/For_others/di_Fonzo_Andrea/20230102_Glioblastoma_proteomics/proteinGroups_Filtered (1).xlsx")%>%
+  janitor::clean_names()
+
+```
+
+The raw data represents the output from the MaxQuant <https://www.maxquant.org/> search of the raw MS spectra from the MS/MS measurement. It has been already corrected for missidentified and only reverse identified peptides.
+
+To further work with the data, we only need the uniprot_id, gene_name and corrected reporter intensity information. So, the df will be subsetted for this data.
+
+```{r}
+df_prot <- df_prot %>%
+  dplyr::select(majority_protein_i_ds, gene_names, contains("reporter_intensity_corrected")) %>%
+  dplyr::rename("uniprot_id" = "majority_protein_i_ds") %>%
+  dplyr::rename("gene_id" = "gene_names") %>%
+  dplyr::rename_with(.cols = -c("uniprot_id", "gene_id"), .fn = ~ stringr::str_remove(string = ., "reporter_intensity_corrected"))
+```
+
+Quick check for the number of missing values.
+
+```{r}
+#convert NaN to NA
+df_prot[df_prot == "NaN"] <- NA_integer_
+
+#convert Zero values to NA
+df_prot[,-c(1:2)][df_prot[,-c(1:2)] == "0"] <- NA_integer_
+
+#remove rows with only NA
+df_prot <- df_prot %>%
+  filter(rowSums(is.na(df_prot[,-c(1:2)])) != ncol(df_prot[,-c(1:2)]))
+
+print(paste("Total number of missing values: ", sum(is.na(df_prot))))
+```
+
+Check for duplicates in features and samples.
+
+```{r}
+print(paste("Number of duplicated features: ", sum(duplicated(df_prot$uniprot_id))))
+
+print(paste("Number of duplicated samples: ", sum(duplicated(colnames(df_prot[,-c(1:2)])))))
+
+
+```
+
+### Missing value pattern
+
+In TMT-measured experiments, there occurs missing data and the missing data patterns is usually present not-at-random. So, lets quickly investigate the number of missing values and also the number of identified proteins per sample.
+
+```{r}
+#| eval: false
+
+#combine both replicates 
+df_long <- cbind(
+  df_prot %>%
+    dplyr::select(uniprot_id, contains("r1")) %>%
+    tidyr::pivot_longer(!uniprot_id,
+                        names_to = "Prot_id1",
+                        values_to = "count_R1"),
+  df_prot %>%
+    dplyr::select(uniprot_id, contains("r2")) %>%
+    tidyr::pivot_longer(!uniprot_id,
+                        names_to = "Prot_id2",
+                        values_to = "count_R2") %>%
+    dplyr::select(-uniprot_id)
+    
+) %>%
+  rowwise() %>%
+  dplyr::mutate(avg_count = mean(c_across(cols = c(count_R1, count_R2)), na.rm = TRUE))
+
+#reformat the NA 
+df_long$avg_count[df_long$avg_count == "NaN"] <- NA_integer_
+```
+
+```{r}
+#| echo: false 
+
+df_long <- readRDS("20230102_df_long.rds")
+```
+
+
+Visualize the numbers of missing values per sample
+
+```{r}
+#| fig-cap: Sample-wise percentage of missing values
+#| fig-width: 12
+#| fig-height: 4
+
+comb1 <- df_long %>%
+  group_by(Prot_id1) %>%
+  summarise(na_rate = sum(is.na(avg_count))) %>%
+  mutate(Prot_id2 = Prot_id1) %>%
+  separate(Prot_id2, c("remove", "Plex"), sep = "r1_") %>%
+  mutate(na_perc = na_rate / nrow(df_prot)) 
+
+ggplot(comb1, aes(
+    x = forcats::fct_reorder(Prot_id1, na_perc),
+    y = na_perc,
+    fill = Plex
+  )) +
+  geom_col() +
+  theme_cowplot() +
+  labs(x = "Prot_id", y = "[%] of proteins missing") +
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line.y =  element_line(colour = "black"),
+    axis.line.x =  element_line(colour = "black"),
+    axis.text.y = element_text(colour = "black"),
+    legend.title = element_blank(),
+    axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    ),
+    legend.position = "none"
+  ) 
+```
+
+As directly visible, plex 1192 displays a high number of missing values. This will affect the further analysis, so I took these out of the data set
+
+```{r}
+df_prot <- df_prot %>%
+  dplyr::select(-contains("1192"))
+```
+
+```{r}
+#| fig-cap: Sample-wise percentage of missing values
+#| fig-width: 12
+#| fig-height: 4
+
+library(randomcoloR)
+
+plex_vec <- unique(
+  stringr::str_remove(
+    colnames(df_prot[,-c(1,2)]), 
+    "_._r1_|_._r2_|_.._r1_|_.._r2_")
+  ) 
+
+palette <- distinctColorPalette(length(plex_vec))
+
+comb <- df_long %>% 
+  dplyr::filter(!grepl("1192", Prot_id1)) %>%
+  group_by(Prot_id1) %>%
+  summarise(na_rate = sum(is.na(avg_count))) %>%
+  mutate(Prot_id2 = Prot_id1) %>%
+  separate(Prot_id2, c("remove", "Plex"), sep = "r1_") %>%
+  mutate(na_perc = na_rate / nrow(df_prot)) 
+
+ggplot(comb, aes(
+    x = forcats::fct_reorder(Prot_id1, na_perc),
+    y = na_perc,
+    fill = Plex
+  )) +
+  geom_col() +
+  theme_cowplot() +
+  labs(x = "Prot_id", y = "[%] of proteins missing") +
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line.y =  element_line(colour = "black"),
+    axis.line.x =  element_line(colour = "black"),
+    axis.text.y = element_text(colour = "black"),
+    legend.title = element_blank(),
+    axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    ),
+    legend.position = "none"
+  )  +
+  scale_fill_manual(values = palette)
+```
+
+Print the metrics for missing values
+
+```{r}
+print(paste("Total number of proteins identified:", nrow(df_prot), sep = " "))
+
+print(paste("Median number of proteins identified per sample:", nrow(df_prot) - median(comb$na_rate), sep = " "))
+
+print(paste("Minimum number of proteins identified per sample:", nrow(df_prot) - max(comb$na_rate), sep = " "))
+
+print(paste("Maximum number of proteins identified per sample:", nrow(df_prot) - min(comb$na_rate), sep = " "))
+```
+
+### Replicate correlation
+
+Each plex was measured in two technical replicates, so we investigate the correlation between both replicates
+
+```{r}
+#| label: Replicate_correlation
+#| fig-cap: Sample-wise correlation over the technical replicates
+#| fig-width: 5
+#| fig-height: 4
+
+library(ComplexHeatmap)
+library(circlize)
+
+R1 <- df_prot %>%
+  dplyr::select(contains("r1"))
+
+R2 <- df_prot %>%
+  dplyr::select(contains("r2"))
+
+#set the color-vector 
+color_fun_corr = colorRamp2(c(-1, 0, 1), c("blue", "white", "red"))
+
+cor(R1, R2, method = "spearman", use = "pairwise.complete.obs") %>%
+  Heatmap(as.matrix(.),
+                   column_title = "Replicate 1",
+                   row_title = "Replicate 2",
+                   col = color_fun_corr,
+                   show_row_names = FALSE,
+                   show_column_names = FALSE,
+                   cluster_rows = FALSE,
+                   cluster_columns = FALSE,
+                   name = "Spearman's R") %>%
+  draw()
+```
+
+### Reference channel correlation
+
+There is a high correlation over the replicates. So, in a next step lets correlate the measured intensities over the reference channel.
+
+```{r}
+#| label: Reference_channel_correlation
+#| fig-cap: Correlation over the reference channels
+#| fig-width: 4
+#| fig-height: 4
+
+df_wide <- df_long %>%
+  dplyr::select(c("uniprot_id", "Prot_id1", "avg_count")) %>%
+  pivot_wider(names_from = "Prot_id1", values_from = avg_count)
+
+#first, compute the reference-channel correlation 
+ref_cor <- df_wide %>%
+  dplyr::select(starts_with("_1_")) %>%
+  cor(., method = "spearman", use = "pairwise.complete.obs") %>%
+  as.data.frame() %>%
+  mutate(type = "ref") %>%
+  pivot_longer(!c(type), names_to = "Prot_id", values_to = "count") %>%
+  filter(count != 1)
+
+ref_cor <- ref_cor[duplicated(ref_cor$count),]
+
+ggplot(ref_cor, aes(count)) +
+  geom_density(fill = "#2a9d8f") +
+  cowplot::theme_cowplot() +
+  labs(x = "Spearman's R" ) 
+
+```
+
+There seems to be a fair correlation for the reference channels.
+
+### Raw data distribution
+
+Inspect how the data is distributed without any correction.
+
+```{r}
+#| fig-cap: Raw intensity distribution per sample
+#| fig-width: 14
+#| fig-height: 10
+
+order_vec <- colnames(df_prot[,-c(1:2)])
+
+
+plot_grid(
+  df_prot %>%
+    dplyr::select(-gene_id) %>%
+    pivot_longer(!uniprot_id, names_to = "Prot_id", values_to = "intensity") %>%
+    mutate(splitter = Prot_id) %>%
+    separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+    filter(grepl("_r1_", Prot_id)) %>%
+    ggplot(aes(
+      factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+    )) +
+    geom_boxplot() +
+    theme_cowplot() +
+    theme(axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    )) +
+    labs(x = "", y = "log2(intensity)", title = "Replicate 1") +
+    scale_fill_manual(values = palette),
+  
+  df_prot %>%
+    dplyr::select(-gene_id) %>%
+    pivot_longer(!uniprot_id, names_to = "Prot_id", values_to = "intensity") %>%
+    mutate(splitter = Prot_id) %>%
+    separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+    filter(grepl("_r2_", Prot_id)) %>%
+    ggplot(aes(
+      factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+    )) +
+    geom_boxplot() +
+    theme_cowplot() +
+    theme(axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    )) +
+    labs(x = "", y = "log2(intensity)", title = "Replicate 2") +
+    scale_fill_manual(values = palette),
+  
+  nrow = 2
+)
+
+```
+
+### Sample loading normalization
+
+In the first step, we normalize within each plex by creating a normalization factor from a global scaling value (median of all column sums) divided by each samples column sum.
+
+```{r}
+#| fig-cap: Sample-loading normalized intensity distribution per sample
+#| fig-width: 14
+#| fig-height: 10
+
+## create a vector of plexes
+plex_vec <- unique(
+  stringr::str_remove(
+    colnames(df_prot[,-c(1,2)]), 
+    "_._r1_|_._r2_|_.._r1_|_.._r2_")
+  ) 
+
+
+# Store each plex into a list embedment
+plex_list <- list() 
+for(i in plex_vec) {
+  
+  plex_list[[i]] <- df_prot %>% 
+    dplyr::select(contains(i))
+  
+}
+
+#create the target scaling factor 
+colsum_vec <- c() 
+
+for(i in plex_vec) {
+  
+  df <- plex_list[[i]]
+  
+  colsum_vec <- c(colsum_vec, colSums(df, na.rm = TRUE))
+  
+}
+
+target <- median(colsum_vec, na.rm = TRUE)
+
+#correct per plex with a helper function
+run_sl_correct <- function(Y) {
+  norm_facs <- target / colSums(Y, na.rm = TRUE)
+  output_sl <- sweep(Y, 2, norm_facs, FUN = "*")
+  
+  return(output_sl)
+}
+
+data_sl_repl <- plex_list%>%
+  purrr::map(run_sl_correct) %>% 
+  bind_cols()
+
+
+#Visualize the output 
+plot_grid(
+  data_sl_repl %>%
+    rownames_to_column("n") %>%
+    pivot_longer(!n, names_to = "Prot_id", values_to = "intensity") %>%
+    mutate(splitter = Prot_id) %>%
+    separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+    filter(grepl("_r1_", Prot_id)) %>%
+    ggplot(aes(
+      factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+    )) +
+    geom_boxplot() +
+    theme_cowplot() +
+    theme(axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    )) +
+    labs(x = "", y = "log2(intensity)", title = "Replicate 1") +
+    scale_fill_manual(values = palette),
+  
+  data_sl_repl %>%
+    rownames_to_column("n") %>%
+    pivot_longer(!n, names_to = "Prot_id", values_to = "intensity") %>%
+    mutate(splitter = Prot_id) %>%
+    separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+    filter(grepl("_r2_", Prot_id)) %>%
+    ggplot(aes(
+      factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+    )) +
+    geom_boxplot() +
+    theme_cowplot() +
+    theme(axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    )) +
+    labs(x = "", y = "log2(intensity)", title = "Replicate 2") +
+    scale_fill_manual(values = palette),
+  
+  nrow = 2
+)
+```
+
+Lets also check for the correlation between the random set of channels
+
+```{r}
+#| fig-cap: Correlation of samples
+#| fig-width: 6
+#| fig-height: 6
+library(psych)
+
+sl_test_data <- data_sl_repl %>%
+  dplyr::select(contains("r1")) %>%
+  dplyr::select(contains(plex_vec[1:6])) %>%
+  dplyr::select(contains("_10_"))
+pairs.panels(log2(sl_test_data), lm = TRUE, main = "Random channel over plexes SL")
+```
+
+There is a fair amount of correlation, but still with room for improvement. Let's further have a look into the general structure in the dataset by PCA. Since we are working with a dataset that contains missing data, we probabilistic PCA (pPCA) that accounts for missing data <http://www.cs.columbia.edu/~blei/seminar/2020-representation/readings/TippingBishop1999.pdf>.
+
+```{r}
+#| fig-cap: Probabilistic PCA after sample loading normalization
+#| fig-width: 5
+#| fig-height: 4
+
+library(pcaMethods)
+library(scrime)
+
+threshold <- 0.5
+ppca_df <- data_sl_repl %>% 
+  filter(rowMeans(is.na(.)) < threshold) %>%
+  #feature-wise scaling and centering 
+  rowScales() %>%
+  as.data.frame()
+
+data_ppca <- pcaMethods::pca(t(as.matrix(ppca_df)), method = "ppca", nPcs = 2, seed = 123)
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  separate(Prot_id, c("Number", "Plex"), sep = "_r1_|_r2_")
+
+ggplot(ppca_out, aes(PC1, PC2, col = Plex)) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = palette) +
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)"))
+```
+
+The replicates fall together and the plexes are somewhat close to each other, however there is still a clear separation in the dataset.
+
+### Internal reference scaling
+
+Here, we use the reference factors, to create a protein- and reference channel wise scaling factor, that brings the proteins over all samples into a similar range.
+
+```{r}
+#| fig-cap: Sample-loading and internal reference scaling normalized intensity distribution per sample
+#| fig-width: 14
+#| fig-height: 10
+#| 
+#make a dataframe of the reference channels per plex 
+irs_factors <- data_sl_repl %>% 
+  dplyr::select(contains("_1_"))
+#calculate the geometric mean per sample 
+irs_factors$geomean <- apply(irs_factors, 1, function(x) exp(mean(log(x), na.rm = TRUE)))
+#pull out sample names to identify  !!! Adjust removal position to geomeam column
+irs_factor_vec = as.vector(names(irs_factors[,-c(33)]))
+#create the protein and reference channel wise scaling factor
+for(i in irs_factor_vec) {
+  factor <-  irs_factors$geomean / (irs_factors %>% dplyr::select(i))
+  irs_factors[,paste0("fac_",i)] <- factor
+}
+
+irs_mult <- colnames(irs_factors %>% dplyr::select(contains("fac"))) %>% as.data.frame
+
+irs_mult <- cbind(irs_mult, irs_mult) 
+
+colnames(irs_mult) <- c("factor", "exp")
+
+irs_mult<- irs_mult %>%
+  separate(exp, c("discard", "plex"), sep = "\\_1_") %>%
+  dplyr::select(-discard) %>% 
+  filter(plex != "r1_1097")
+
+irs_mult_vec = as.vector(irs_mult$plex)
+
+irs_fac_filt <- irs_factors %>% dplyr::select(contains("fac"))
+
+all_irs <- (data_sl_repl %>% dplyr::select(contains("r1_1097"))) * unlist(irs_fac_filt %>% dplyr::select(contains("r1_1097")))
+
+for(i in irs_mult_vec) {
+  all_irs <- cbind(all_irs, (data_sl_repl %>% dplyr::select(contains(i))) * unlist(irs_fac_filt %>% dplyr::select(contains(i))))
+}
+
+#Visualize the output
+
+#Visualize the output 
+plot_grid(
+  all_irs %>%
+    rownames_to_column("n") %>%
+    pivot_longer(!n, names_to = "Prot_id", values_to = "intensity") %>%
+    mutate(splitter = Prot_id) %>%
+    separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+    filter(grepl("_r1_", Prot_id)) %>%
+    ggplot(aes(
+      factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+    )) +
+    geom_boxplot() +
+    theme_cowplot() +
+    theme(axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    )) +
+    labs(x = "", y = "log2(intensity)", title = "Replicate 1") +
+    scale_fill_manual(values = palette),
+  
+  all_irs %>%
+    rownames_to_column("n") %>%
+    pivot_longer(!n, names_to = "Prot_id", values_to = "intensity") %>%
+    mutate(splitter = Prot_id) %>%
+    separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+    filter(grepl("_r2_", Prot_id)) %>%
+    ggplot(aes(
+      factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+    )) +
+    geom_boxplot() +
+    theme_cowplot() +
+    theme(axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    )) +
+    labs(x = "", y = "log2(intensity)", title = "Replicate 2") +
+    scale_fill_manual(values = palette),
+  
+  nrow = 2
+)
+```
+
+Lets also check for the correlation between the random set of channels
+
+```{r}
+#| fig-cap: Correlation of samples
+#| fig-width: 6
+#| fig-height: 6
+
+sl_test_data <- all_irs %>%
+  dplyr::select(contains("r1")) %>%
+  dplyr::select(contains(plex_vec[1:6])) %>%
+  dplyr::select(contains("_10_"))
+pairs.panels(log2(sl_test_data), lm = TRUE, main = "Random channel over plexes SL")
+```
+
+This correlation looks well improved. Lets also investigate the pPCA.
+
+```{r}
+#| fig-cap: Probabilistic PCA after sample loading normalization and internal reference scaling (IRS)
+#| fig-width: 5
+#| fig-height: 4
+
+ppca_df <- all_irs %>% 
+  filter(rowMeans(is.na(.)) < threshold) %>%
+  #feature-wise scaling and centering 
+  rowScales() %>%
+  as.data.frame()
+
+data_ppca <- pcaMethods::pca(t(as.matrix(ppca_df)), method = "ppca", nPcs = 2, seed = 123)
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  separate(Prot_id, c("Number", "Plex"), sep = "_r1_|_r2_")
+
+ggplot(ppca_out, aes(PC1, PC2, col = Plex)) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = palette) +
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)"))
+```
+
+The replicates still fall together, but the overall structure improved: no more separation into two blocks and certain "spreading" of the individual samples.
+
+### Merge replicates by average
+
+```{r}
+#| eval: false
+
+df_prot_norm <- cbind(df_prot[,c(1)], all_irs) %>%
+  dplyr::select(-contains("_1_"))
+
+df_long_norm <- cbind(
+  df_prot_norm %>%
+    dplyr::select(uniprot_id, contains("r1")) %>%
+    tidyr::pivot_longer(!uniprot_id,
+                        names_to = "Prot_id1",
+                        values_to = "count_R1"),
+  df_prot_norm %>%
+    dplyr::select(uniprot_id, contains("r2")) %>%
+    tidyr::pivot_longer(!uniprot_id,
+                        names_to = "Prot_id2",
+                        values_to = "count_R2") %>%
+    dplyr::select(-uniprot_id)
+    
+) %>%
+  rowwise() %>%
+  dplyr::mutate(avg_count = mean(c_across(cols = c(count_R1, count_R2)), na.rm = TRUE))
+
+#reformat the NA 
+df_long_norm$avg_count[df_long_norm$avg_count == "NaN"] <- NA_integer_
+
+df_wide_norm <- df_long_norm %>%
+  pivot_wider(!uniprot_id, names_from = "Prot_id1", values_from = avg_count)
+```
+
+```{r}
+#| echo: false 
+
+df_wide_norm <- readRDS("20230102_df_wide_norm.rds")
+```
+
+### Final data investigation 
+
+First, visualize the distribution per sample 
+
+```{r}
+#| fig-cap: Sample-loading and internal reference scaling normalized intensity distribution per sample after mean merge of replicates
+#| fig-width: 14
+#| fig-height: 5
+
+df_wide_norm[,-1] %>%
+    rownames_to_column("n") %>%
+    pivot_longer(!n, names_to = "Prot_id", values_to = "intensity") %>%
+    mutate(splitter = Prot_id) %>%
+    separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+    filter(grepl("_r1_", Prot_id)) %>%
+    ggplot(aes(
+      factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+    )) +
+    geom_boxplot() +
+    theme_cowplot() +
+    theme(axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    )) +
+    labs(x = "", y = "log2(intensity)") +
+    scale_fill_manual(values = palette)
+```
+
+
+```{r}
+#| fig-cap: Probabilistic PCA after sample loading normalization and IRS plus mean merged for replicates
+#| fig-width: 5
+#| fig-height: 4
+
+ppca_df <- df_wide_norm[,-1] %>% 
+  filter(rowMeans(is.na(.)) < threshold) %>%
+  #feature-wise scaling and centering 
+  rowScales() %>%
+  as.data.frame()
+
+data_ppca <- pcaMethods::pca(t(as.matrix(ppca_df)), method = "ppca", nPcs = 2, seed = 123)
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  separate(Prot_id, c("Number", "Plex"), sep = "_r1_|_r2_")
+
+ggplot(ppca_out, aes(PC1, PC2, col = Plex)) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = palette) +
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)"))
+```
+
+Check, how the missing value pattern affects the global data structure 
+
+```{r}
+#| fig-cap: Probabilistic PCA of final dataset colored for missing value rate 
+#| fig-width: 5
+#| fig-height: 4
+
+comb_df <- comb %>%
+  dplyr::select(Plex, na_perc) %>%
+  group_by(Plex) %>%
+  summarise(na = mean(na_perc))
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  separate(Prot_id, c("Number", "Plex"), sep = "_r1_|_r2_") %>%
+  left_join(comb_df, 
+            by = "Plex")
+
+ggplot(ppca_out, aes(PC1, PC2, col = na)) +
+  geom_point(size = 3) +
+  scale_color_viridis_c()+
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)")) +
+  labs(color = "% missing")
+```
+
+There seems to be a clear separation on the basis of the missing value pattern. Additionally, there is a segregation visible in the PC2. Only a fraction of the samples have been used to generate the internal reference scaling standard (iST). Hence, check how these samples fall in the global structure of the probabilistic PCA. 
+
+```{r}
+#| fig-cap: Probabilistic PCA of final dataset colored iST defining samples
+#| fig-width: 5
+#| fig-height: 4
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  mutate(iST = case_when( 
+    grepl("2572", Prot_id) ~ "iST", 
+    Prot_id %in% c("_2_r1_2573", "_3_r1_2573", "_4_r1_2573", "_5_r1_2573", "_6_r1_2573", "_7_r1_2573") ~ "iST", 
+    TRUE ~ "no iST"))
+
+ggplot(ppca_out, aes(PC1, PC2, col = iST)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("red", "grey"))+
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)")) +
+  labs(color = "% missing")
+```
+
+Together, there is a strong influence of the missing value pattern as well as the sample choice for the iST generation on the overall data structure. 
+
+
+### Session information
+
+```{r}
+sessionInfo()
+```
+
