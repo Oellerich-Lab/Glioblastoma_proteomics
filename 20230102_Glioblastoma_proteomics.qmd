@@ -781,6 +781,119 @@ ggplot(ppca_out, aes(PC1, PC2, col = iST)) +
 
 Together, there is a strong influence of the missing value pattern as well as the sample choice for the iST generation on the overall data structure. 
 
+### HarmonizR correction 
+
+Given the strong impact of the missing value pattern and the iRS sample selection, removing these batch effects might be necessary. To overcome this batch effect situation, I tried to utilize the batch-effect correction by “harmonizeR” (https://www.nature.com/articles/s41467-022-31007-x).
+
+First, create the batch vector information 
+
+```{r}
+#| eval: false
+
+batch_df <- tibble(samplename = colnames(df_wide_norm[,-1])) %>%
+  rowid_to_column("ID") %>%
+  relocate(ID, .after = samplename) %>%
+  mutate(batch = case_when(
+    grepl("1097|1111|1129|1140|1150|1162|1177", samplename) ~ 2,
+    grepl("2572|2573", samplename) ~ 3,
+    TRUE ~ 1
+  ))
+```
+
+Next, run the HarmonizR framework. Since this is computationally intensive, it was run on a cluster and loaded afterwards 
+
+```{r}
+#| eval: false
+
+library(HarmonizR)
+
+harmonize_df <- df_wide_norm %>%
+  column_to_rownames("uniprot_id")
+
+harmonize_df_parametric <- HarmonizR::harmonizR(
+  data_as_input = harmonize_df, 
+  description_as_input = batch_df, 
+  algorithm = "ComBat", 
+  ComBat_mode = 3,
+  plot = "samplemeans"
+)
+```
+
+```{r}
+#| echo: false
+
+harmonize_df_parametric <- readRDS("20230102_cured_data.rds")
+```
+
+```{r}
+#| fig-cap: Probabilistic PCA after HarmonizR-based batch correction 
+#| fig-width: 5
+#| fig-height: 4
+
+ppca_df <- harmonize_df_parametric %>% 
+  filter(rowMeans(is.na(.)) < threshold) %>%
+  #feature-wise scaling and centering 
+  rowScales() %>%
+  as.data.frame()
+
+data_ppca <- pcaMethods::pca(t(as.matrix(ppca_df)), method = "ppca", nPcs = 2, seed = 123)
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  separate(Prot_id, c("Number", "Plex"), sep = "_r1_|_r2_")
+
+ggplot(ppca_out, aes(PC1, PC2, col = Plex)) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = palette) +
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)"))
+```
+
+Check, how the missing value pattern affects the global data structure 
+
+```{r}
+#| fig-cap: Probabilistic PCA after HarmonizR approach colored for % of missing values 
+#| fig-width: 5
+#| fig-height: 4
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  separate(Prot_id, c("Number", "Plex"), sep = "_r1_|_r2_") %>%
+  left_join(comb_df, 
+            by = "Plex")
+
+ggplot(ppca_out, aes(PC1, PC2, col = na)) +
+  geom_point(size = 3) +
+  scale_color_viridis_c()+
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)")) +
+  labs(color = "% missing")
+```
+
+There seems to be a removal of the impact of the missing value pattern on the data. Now, check how the iST-defining samples are located.
+
+```{r}
+#| fig-cap: Probabilistic PCA after HarmonizR correction colored iST defining samples
+#| fig-width: 5
+#| fig-height: 4
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  mutate(iST = case_when( 
+    grepl("2572", Prot_id) ~ "iST", 
+    Prot_id %in% c("_2_r1_2573", "_3_r1_2573", "_4_r1_2573", "_5_r1_2573", "_6_r1_2573", "_7_r1_2573") ~ "iST", 
+    TRUE ~ "no iST"))
+
+ggplot(ppca_out, aes(PC1, PC2, col = iST)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("red", "grey"))+
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)")) +
+  labs(color = "% missing")
+```
 
 ### Session information
 
