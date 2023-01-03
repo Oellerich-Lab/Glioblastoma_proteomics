@@ -895,6 +895,543 @@ ggplot(ppca_out, aes(PC1, PC2, col = iST)) +
   labs(color = "% missing")
 ```
 
+Since we have certain metadata for the IDH mutation data, check how IDH mutant samples distribute in the dataset 
+
+```{r}
+#| fig-cap: Probabilistic PCA after HarmonizR correction colored iST defining samples
+#| fig-width: 5
+#| fig-height: 4
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("prot_id") %>%
+  left_join(df_meta %>%
+              dplyr::select(prot_id, idh_wt), 
+            by = "prot_id")
+
+ggplot(ppca_out, aes(PC1, PC2, col = factor(idh_wt))) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c( "#e76f51", "#2a9d8f"))+
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)")) +
+  labs(color = "IDH status")
+```
+
+PC2 seems to represent certain structure regarding the IDH mutation status. Hence, I inspected the loadings for PC2. Note that I am interested in characterizing loadings, that associate with IDH mutate status. Since IDH mut cases are found mostly in the negative fraction of PC2, I inverted the loadings presign. 
+
+```{r}
+#| fig-cap: GSEA for PC2 loadings that correspond to IDH mutant status
+#| fig-width: 14
+#| fig-height: 7
+
+library(fgsea)
+
+ppca_loadings <- loadings(data_ppca) %>%
+  as.data.frame() %>%
+  rownames_to_column("uniprot_id") %>%
+  left_join(df_prot[,c(1,2)], by = "uniprot_id") %>%
+  separate(gene_id, c("gene_id", "rem"), sep = ";") %>%
+  dplyr::select(-rem) %>%
+  mutate(PC2 = PC2 * (-1))
+
+#generate ranked gene vector 
+pc2_vec <- ppca_loadings %>%
+  dplyr::select(gene_id, PC2) %>%
+  arrange(desc(PC2)) %>%
+  distinct(gene_id, .keep_all = TRUE) %>%
+  deframe()
+
+#load the go database
+pathways_go <- gmtPathways("/Users/juliusenssle/Library/CloudStorage/OneDrive-JohannWolfgangGoetheUniversität/2021_DLBCL_proteogenomics/GSEA_gene_sets/c5.go.v7.4.symbols.gmt")
+
+#run the fgsea
+fgsea_res_go <-
+    fgseaMultilevel(
+      pathways = pathways_go,
+      stats = pc2_vec,
+      minSize = 15,
+      maxSize = 500
+    )
+
+#filter for top and bottom enriched pathways 
+fgsea_res_filt_go <-
+    fgsea_res_go  %>%
+    as_tibble() %>%
+    drop_na(padj) %>%
+    filter(padj <= 0.01) %>%
+    dplyr::select(pathway, pval, padj, NES, size) %>%
+    arrange(desc(NES)) %>%
+    headtail(15, digits = 16) %>%
+  drop_na(pathway)
+
+#Visualize the results 
+ggplot(fgsea_res_filt_go,
+         aes(
+           x = fct_reorder(pathway, as.numeric(NES)),
+           y = as.numeric(NES)
+         )) +
+  coord_flip() +
+  theme_bw() +
+  labs(title = "IDH mut PC GSEA (FDR 0.01)", x = "", y = "NES") +
+  geom_col(aes(fill = as.numeric(padj))) +
+  theme(
+    axis.line = element_line(size = 0.8),
+    axis.line.y = element_blank(),
+    axis.text = element_text(size = 10, colour = "black"),
+    axis.title = element_text(size = 12),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.border = element_blank()
+  ) +
+  scale_fill_viridis_c() +
+  labs(fill = "p.adj") +
+  theme(
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    legend.text = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    plot.title = element_text(size = 10))
+
+```
+
+There is a clear enrichment in neurotransmitter-associated, vesicle-transport-associated and cellular-respiration-associated terms. 
+
+### Hierarchical clustering of global protein expression data 
+
+To investigate, whether different groups of samples are detectable for the protein expression data, I used a consensus-clustering-based hierarchical clustering by utilizing the spearman pairwise correlation based distance information for all the different samples. Running this in a consensus based fashion generates a robust grouping information. For a detailed information regarding consensus clustering, please refer to <https://link.springer.com/article/10.1023/A:1023949509487> and <https://pubmed.ncbi.nlm.nih.gov/20427518/>. 
+
+```{r}
+library(ConsensusClusterPlus)
+
+df_lm <- log2(harmonize_df_parametric) %>%
+  filter(
+  	rowMeans(is.na(.)) < threshold
+  	)
+
+#create matrix and perform proteinwise (row-wise) z-score transformation
+df_lm_sc <- rowScales(as.matrix(df_lm))
+
+#create distance matrix for pearson corr with pairwise complete observation
+dt = as.dist(
+	(1-cor(df_lm_sc, method="spearman", use = "pairwise.complete.obs")
+		)
+	)
+
+rcc2 = ConsensusClusterPlus(dt,
+                            maxK=8,
+                            reps=100,
+                            pItem=0.8,
+                            pFeature=1,
+                            title="title", #give it any title 
+                            innerLinkage="complete", 
+                            distance = "spearman", 
+                            finalLinkage="complete",
+                            clusterAlg="hc", 
+                            plot = "none" #set this to "pdf" if you want a pdf report
+                            )  
+#further identify CLC values 
+icl = calcICL(rcc2, 
+              title = "title", # set this to any title
+              plot = "none" #set this to "pdf" if you want a pdf report
+              )
+```
+
+Given the Consensus Matrix, the cummulative-distribution-function as well as the ellbow-cut-off of the relative change in the AUCDFC, I would further proceed with an optimal k of 5. Now, extract the clustering information for k=5 groups and visualize via heatmap. 
+
+```{r}
+#| fig-cap: Spearman-distance-based hierarchical clustering of global protein expression data 
+#| fig-width: 6
+#| fig-height: 6
+
+cluster_df <- rcc2[[5]]$consensusClass %>%
+  as.data.frame() %>%
+  rownames_to_column("prot_id")
+
+colnames(cluster_df) <- c("prot_id", "value")
+
+#load package
+library(ComplexHeatmap)
+library(circlize)
+
+cohort_order <- t(df_lm_sc) %>%
+  as.data.frame() %>%
+  rownames_to_column("Prot_id") %>%
+  filter(Prot_id %in% df_meta$prot_id)
+
+df_meta <- df_meta %>%
+  dplyr::slice(match(cohort_order$Prot_id, prot_id)) %>%
+  left_join(cluster_df, 
+            by = "prot_id")
+
+#define color space for creation of heatmap 
+color_fun_glio = colorRamp2(c(min(dt), 
+                              quantile(dt, 0.25),
+                              median(dt) , 
+                              quantile(dt, 0.75),
+                              max(dt)), 
+                            c("navyblue", #
+                                        "lightskyblue",
+                                        "white",
+                                        "red2",
+                                        "red4"))
+
+
+#create top annotation for heatmap
+coo_anno = HeatmapAnnotation(
+  IDH_status = df_meta[[8]],
+  Cluster = df_meta[[14]],
+  col = list(
+    IDH_status = c(
+    "mut" = "#e76f51",
+    "wt" = "#2a9d8f"
+    #NA = "grey"
+    ),
+    Cluster = c(
+      "1" = "#ef476f",
+      "2" = "#ffd166",
+      "3" = "#06d6a0",
+      "4" = "#118ab2", 
+      "5" = "#073b4c"
+    )
+))
+
+#plot heatmap with included hc and COO annotation
+ht <- Heatmap(as.matrix(dt),
+              col = color_fun_glio,
+              column_split = data.frame(df_meta$value),
+              row_split = 5,
+              column_title = " ",
+              row_title = " ",
+              border = F,
+              show_row_dend = FALSE,
+              #column_gap = unit(c(0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0), "mm"),
+              show_column_dend = FALSE,
+              cluster_rows = TRUE,
+              cluster_columns = TRUE,
+              show_column_names = FALSE,
+              show_row_names = FALSE,
+              top_annotation = coo_anno,
+              #bottom_annotation = clust_anno,
+              name = "distance") %>%
+  draw(heatmap_legend_side = "right", annotation_legend_side ="bottom", merge_legend = TRUE)
+```
+
+The top row annotates the IDH status and the second row highlights the proteomics data-inferred clusters. The heatmap below represents the distance from each sample to each other sample in the proteomics data space.
+
+### Cluster-wise gene-set enrichement analysis 
+
+In a first step, it is necessary to identify differentially expressed features between the classes. To achieve this, I used the limma-based approach with providing the batch information I used for HarmonizR correction as a covariate.  
+
+First, filter out all-NA columns 
+
+```{r}
+threshold <- 0.999
+#filter dataset for proteins with less then 50% NA
+prot_limma <- left_join(df_prot[,c(1,2)],
+            df_wide_norm, 
+            by = "uniprot_id") %>%
+  separate(gene_id, c("gene_id", "rem")) %>%
+  dplyr::select(-c("uniprot_id", "rem")) %>%
+  filter(rowMeans(is.na(.[,-c(1)])) < threshold)
+```
+
+Match the class df order to the proteome df order 
+
+```{r}
+cohort_order <- prot_limma[,-c(1)] %>% t() %>% as.data.frame() %>% rownames_to_column("prot_id")
+df_meta <- df_meta %>%
+  dplyr::slice(match(cohort_order$prot_id, prot_id))
+```
+
+Create the identifiers for differential testing 
+
+```{r}
+limma_ident <-  df_meta %>%
+  mutate(class = as.factor(value)) %>%
+  mutate(batch = case_when(
+    grepl("1097|1111|1129|1140|1150|1162|1177", prot_id) ~ 2,
+    grepl("2572|2573", prot_id) ~ 3,
+    TRUE ~ 1
+  )) %>%
+  dplyr::select(prot_id, class, batch)
+  
+limma_df <- prot_limma
+```
+
+Set the annotations 
+
+```{r}
+gene_ann <- dplyr::select(limma_df, gene_id)
+count_raw <- dplyr::select(limma_df, -gene_id)
+samples_ann <- limma_ident %>% dplyr::select(prot_id)
+```
+
+Create the model matrix and contrast 
+
+```{r}
+library(limma)
+#create design matrix 
+modelmatrix <- model.matrix(~ 0 + limma_ident$class + limma_ident$batch)
+class_vec <- c("class_1" , "class_2" ,  "class_3" , "class_4" , "class_5", "batch")
+#rename the model matrix
+colnames(modelmatrix) <- class_vec
+contr_matrix_list <- list()
+contr_matrix_list[[1]]  <- makeContrasts(class_1 -((class_2 + class_3  + class_4 + class_5)/4),
+                              levels = modelmatrix)
+contr_matrix_list[[2]] <- makeContrasts(class_2 - ((class_1 + class_3  + class_4 + class_5)/4),
+                              levels = modelmatrix)
+contr_matrix_list[[3]] <- makeContrasts(class_3 - ((class_1 + class_2  + class_4 + class_5)/4),
+                              levels = modelmatrix)
+contr_matrix_list[[4]] <- makeContrasts(class_4 - ((class_1 + class_2  + class_3 + class_5)/4),
+                              levels = modelmatrix)
+contr_matrix_list[[5]] <- makeContrasts(class_5 - ((class_1 + class_2  + class_3 + class_4)/4),
+                              levels = modelmatrix)
+```
+
+Run the limma based differential testing
+
+```{r}
+output_df <- data.frame(#uniprot_id = as.character(),
+                        gene_id = as.character(),
+                        logFC = as.numeric(),
+                        AveExpr = as.numeric(),
+                        t = as.numeric(),
+                        P.Value= as.numeric(),
+                        adj.P.Val = as.numeric(),
+                        B = as.numeric(),
+                        class = as.character())
+for(i in 1:5) {
+  
+  prot_dge_design <- modelmatrix
+  # create EList for LIMMA
+  prot_elist <- list(
+    E = count_raw,
+    targets = samples_ann,
+    genes = gene_ann,
+    design = prot_dge_design
+  ) %>% new("EList", .)
+  
+  #fit model
+  prot_efit <- lmFit(prot_elist, design = modelmatrix)
+  
+  prot_efit <- contrasts.fit(prot_efit, contr_matrix_list[[i]])
+  # assuming that library size is more or less equal in a proteomics dataset, limma-trend is a viable approach
+  prot_efit <- eBayes(prot_efit, trend = T, robust = T)
+  
+  logFC_class <-
+    topTable(prot_efit,
+             adjust = "BH",
+             p.value = 1,
+             number = Inf) %>%
+    mutate(class = as.character(i))
+  
+  output_df <- rbind(output_df, logFC_class)
+}
+output_df <- output_df %>%
+  mutate(q_value = -log10(adj.P.Val)) %>%
+  mutate(signif = case_when(adj.P.Val < 0.01  ~ "sig", TRUE ~ "notsig")) %>%
+  mutate(sig_FC = case_when(signif == "sig" & logFC > 0.2 ~ "sig_fc",
+                            signif == "sig" & logFC < -0.2 ~ "sig_fc", 
+                            TRUE ~ "notsig_fc"))
+```
+
+Now, perform subsequent enrichment analysis for each using the fgsea package
+
+```{r}
+pathways_go <- gmtPathways("/Users/juliusenssle/Library/CloudStorage/OneDrive-JohannWolfgangGoetheUniversität/2021_DLBCL_proteogenomics/GSEA_gene_sets/c5.go.v7.4.symbols.gmt")
+
+results_df <- data.frame(
+  pathway = as.character(),
+  pval = as.numeric(), 
+  padj = as.numeric(), 
+  NES = as.numeric(),
+  size = as.numeric()
+)
+
+for(i in c(1:5)) {
+  output_filt <- output_df %>%
+    dplyr::filter(class == i)
+  
+  diff_exp_vec <- dplyr::select(output_filt, gene_id, t) %>%
+    drop_na(t) %>%
+    arrange(desc(t)) %>%
+    distinct(gene_id, .keep_all = TRUE) %>%
+    deframe()
+  
+  fgsea_res_go <-
+    fgseaMultilevel(
+      pathways = pathways_go,
+      stats = diff_exp_vec,
+      minSize = 15,
+      maxSize = 500
+    )
+  
+  fgsea_res_filt_go <-
+    fgsea_res_go  %>%
+    as_tibble() %>%
+    drop_na(padj) %>%
+    filter(padj <= 0.01) %>%
+    dplyr::select(pathway, pval, padj, NES, size) %>%
+    arrange(desc(NES)) %>%
+    headtail(10, digits = 16)
+  
+  results_df <- rbind(results_df, fgsea_res_filt_go)
+  
+  
+}
+# filter for unique pathway terms
+pathway_df <- results_df %>% distinct(pathway, .keep_all = TRUE) %>%
+  drop_na(pathway)
+```
+
+Now, lets compare the pathways that are found to be enriched in the differentially expressed features across the clusters. To achieve this, I performed a sample-wise gene-set-variation-analysis (GSVA, <https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-14-7>) for the pathways inferred above. This yields a pathway-score for each pathway of interest in each sample. The resulting samples x pathways matrix can then be used in a linear regression analysis with the sample's cluster-membership as regressors to determine the "mean-shift" of each pathway across all clusters. **GSVA** can only deal with complete data, hence I used the established and extensively benchmarked DreamAI imputation framework to impute missing values <https://github.com/WangLab-MSSM/DreamAI>
+
+```{r}
+#| fig-cap: Mean-shift GSVA scores of cluster-defining pathways
+#| fig-width: 14
+#| fig-height: 10
+
+library(GSVA)
+
+threshold <- 0.001
+#filter dataset for proteins with less then 50% NA
+df_imp <- df_wide_norm %>%
+  filter(
+  	rowMeans(is.na(.[,-1])) < threshold
+  	)
+
+#generate final dataset
+df_prot_imp <- left_join(
+  df_prot[, c(1,2)] %>%
+    filter(uniprot_id %in% df_imp$uniprot_id), 
+  df_imp, 
+  by = "uniprot_id"
+) %>%
+  separate(gene_id, c("gene_id", "rm"), sep = ";") %>%
+  dplyr::select(-c("uniprot_id", "rm")) %>%
+  distinct(gene_id, .keep_all = TRUE) %>%
+  drop_na(gene_id) %>%
+  column_to_rownames("gene_id")
+
+#run gsva
+gsva.out <- GSVA::gsva(expr = as.matrix(df_prot_imp), 
+                       gset.idx.list = pathways_go[unique(results_df$pathway)], 
+                       method = "gsva",
+                       kcdf = "Gaussian",
+                       min.sz = 10,
+                       max.sz = 500,
+                       verbose = F) 
+
+#pivot longer for following kruskal wallis
+gsva_out_prot <- gsva.out %>% 
+  as_tibble(rownames = "Pathway") %>% 
+  pivot_longer(names_to = "prot_id", values_to="count", cols=c(-Pathway)) %>% 
+  left_join(df_meta %>% dplyr::select(prot_id, value), by= "prot_id") %>%
+  rename(c("cluster" = "value")) %>%
+  mutate(cluster = as.factor(cluster)) %>%
+  mutate(cluster_name = case_when(
+    cluster == "1" ~ "cluster_1",
+    cluster == "2" ~ "cluster_2",
+    cluster == "3" ~ "cluster_3",
+    cluster == "4" ~ "cluster_4",
+    cluster == "5" ~ "cluster_5"
+  ))
+
+#define kruskal.test function for significance test of differences between clusters
+kruskaltest <- function(set, pthw) {
+  out <- tryCatch(
+    {
+      kruskal.test(set[set$Pathway == pthw,]$count ~ set[set$Pathway == pthw,]$cluster)$p.value
+      
+    },
+    error = function(e)
+    {
+      return(NA)
+    }
+  )
+  return(out)
+}  
+
+#run rowwise kruskal test to identify significant differences of pathway scores over clusters
+gsva_out_prot_posthoc <- gsva_out_prot %>% 
+  distinct() %>%
+  rowwise() %>% 
+  mutate(pva = kruskaltest(gsva_out_prot, Pathway))
+
+# perform multiple testing adjustment
+gsva_out_prot_posthoc <- gsva_out_prot_posthoc %>% 
+  mutate(padj = p.adjust(pva, method = "BH"))
+
+#compare the mean shift 
+gsva_out_prot_meanshift <- gsva_out_prot %>% 
+  filter(Pathway %in% filter(gsva_out_prot_posthoc, padj < 0.01)$Pathway) %>% dplyr::select(Pathway, count, cluster) %>% 
+  fastDummies::dummy_cols(select_columns = "cluster", remove_selected_columns = T) %>%
+  group_by(Pathway) %>% 
+  do(
+    meanshift = lm(count ~ 0 + cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5, .)$coefficients)
+
+#generate the final matrix 
+gsva_out_prot_meanshift_mat <- gsva_out_prot_meanshift %>%   
+  unnest_wider(meanshift) %>% 
+  dplyr::select(-Pathway) %>% 
+  as.matrix() 
+
+prot_names <- rownames(gsva_out_prot_meanshift_mat)
+
+#create rownames 
+rownames(gsva_out_prot_meanshift_mat) <- gsva_out_prot_meanshift$Pathway %>% 
+  str_replace_all(pattern = "_", replacement = " ") %>%
+  str_replace_all(pattern = "GOBP ", replacement = "") %>%
+  str_replace_all(pattern = "GOCC ", replacement = "") %>%
+  str_replace_all(pattern = "GOMF ", replacement = "")%>%
+  str_replace_all(pattern = "HALLMARK ", replacement = "")
+
+gsva_out_prot_meanshift_mat_scaled <- gsva_out_prot_meanshift_mat %>% 
+  t() %>% 
+  scale() %>%
+  t()
+
+#create color frame for meanshift data 
+color_meanshift = colorRamp2(c(
+  min(gsva_out_prot_meanshift_mat_scaled),
+  median(gsva_out_prot_meanshift_mat_scaled),
+  max(gsva_out_prot_meanshift_mat_scaled)
+), c("blue", "white", "red"))
+
+#create cluster annotation
+cluster_anno = HeatmapAnnotation(
+  Class = c("1", "2", "3", "4", "5"),
+  col = list(
+    Class = c(
+     "1" = "#ef476f",
+      "2" = "#ffd166",
+      "3" = "#06d6a0",
+      "4" = "#118ab2", 
+      "5" = "#073b4c"
+    )
+  ),
+  annotation_label = c(" ")
+)
+
+#create heatmap object
+meanshift_proteome_ht <- Heatmap(gsva_out_prot_meanshift_mat_scaled,
+          show_column_names = FALSE,
+          show_row_names = T,
+          col = color_meanshift,
+          cluster_columns = FALSE, 
+          bottom_annotation = cluster_anno, 
+          name = "z-score", 
+          row_split = 6,
+          row_names_gp = gpar(fontsize = 10, face = "bold"),
+          width = unit(12, "cm"), 
+          row_title = " ")  %>%
+  draw(heatmap_legend_side = "left", merge_legend = TRUE)
+```
+
+
 ### Session information
 
 ```{r}
