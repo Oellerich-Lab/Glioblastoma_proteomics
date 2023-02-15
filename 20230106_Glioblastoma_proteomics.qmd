@@ -1099,7 +1099,7 @@ library(ConsensusClusterPlus)
 
 df_lm <- log2(harmonize_df_parametric) %>%
   filter(
-  	rowMeans(is.na(.)) < threshold
+  	rowMeans(is.na(.)) < 0.5
   	)
 
 #create matrix and perform proteinwise (row-wise) z-score transformation
@@ -1112,6 +1112,7 @@ dt = as.dist(
 	)
 
 rcc2 = ConsensusClusterPlus(dt,
+                            seed = 42,
                             maxK=8,
                             reps=100,
                             pItem=0.8,
@@ -1141,7 +1142,7 @@ cluster_df <- rcc2[[5]]$consensusClass %>%
   as.data.frame() %>%
   rownames_to_column("prot_id")
 
-colnames(cluster_df) <- c("prot_id", "value")
+colnames(cluster_df) <- c("prot_id", "cluster")
 
 #load package
 library(ComplexHeatmap)
@@ -1154,7 +1155,7 @@ cohort_order <- t(df_lm_sc) %>%
 
 
 #to be consistent, lets read in the meta data
-df_meta <- read_csv("~/Library/CloudStorage/OneDrive-JohannWolfgangGoetheUniversität/For_others/di_Fonzo_Andrea/20230102_Glioblastoma_proteomics/20230106_glioblastoma_proteomics_shared/20230106_glioblastoma_meta_data.csv")
+df_meta <- readRDS("20230215_df_meta_upd.rds")
 
 df_meta <- df_meta %>%
   dplyr::slice(match(cohort_order$Prot_id, prot_id)) %>%
@@ -1179,9 +1180,9 @@ names(palette) <- unique(df_meta$plex)
 
 #create top annotation for heatmap
 coo_anno = HeatmapAnnotation(
-  IDH_status = df_meta[[8]],
-  Cluster = df_meta[[10]],
-  Plex = df_meta[[5]],
+  IDH_status = df_meta[["idh_wt"]],
+  Cluster = df_meta[["cluster"]],
+  Plex = df_meta[["plex"]],
   col = list(
     IDH_status = c(
     "mut" = "#e76f51",
@@ -1342,7 +1343,7 @@ First, filter out all-NA columns
 threshold <- 0.999
 #filter dataset for proteins with less then 50% NA
 prot_limma <- left_join(df_prot[,c(1,2)],
-            df_wide_norm, 
+            df_wide_norm_upd, 
             by = "uniprot_id") %>%
   separate(gene_id, c("gene_id", "rem")) %>%
   dplyr::select(-c("uniprot_id", "rem")) %>%
@@ -1537,8 +1538,7 @@ gsva.out <- GSVA::gsva(expr = as.matrix(df_prot_imp),
 gsva_out_prot <- gsva.out %>% 
   as_tibble(rownames = "Pathway") %>% 
   pivot_longer(names_to = "prot_id", values_to="count", cols=c(-Pathway)) %>% 
-  left_join(df_meta %>% dplyr::select(prot_id, value), by= "prot_id") %>%
-  rename(c("cluster" = "value")) %>%
+  left_join(df_meta %>% dplyr::select(prot_id, cluster), by= "prot_id") %>%
   mutate(cluster = as.factor(cluster)) %>%
   mutate(cluster_name = case_when(
     cluster == "1" ~ "cluster_1",
@@ -1672,7 +1672,6 @@ write.csv(df_norm_batch_corrected, "20230215_gioblastoma_proteome_norm_withBatch
 
 #export meta data 
 df_exp <- df_meta %>% 
-  dplyr::rename(c("cluster" = "value")) %>%
   dplyr::select(label, tmt_set_name_2, patient, proteomic_id, idh_wt, prot_id, cluster)
 
 #save as csv
