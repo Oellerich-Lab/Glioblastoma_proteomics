@@ -781,6 +781,97 @@ ggplot(ppca_out, aes(PC1, PC2, col = iST)) +
 
 Together, there is a strong influence of the missing value pattern as well as the sample choice for the iST generation on the overall data structure.
 
+### Double measurements 
+
+Some samples were measured twice to have a sort of internal control for the measurement. Let's investigate, how well these samples correlate. First, generate a vector with the respective sample names. 
+
+```{r}
+doubles <- c("_5_r1_2572", "_10_r1_2573", 
+             "_6_r1_2572", "_9_r1_2574", 
+             "_7_r1_2572", "_8_r1_2575", 
+             "_8_r1_2572", "_3_r1_2579",
+             "_9_r1_2572", "_2_r1_2574", 
+             "_10_r1_2572", "_4_r1_1162",
+             "_2_r1_2573", "_8_r1_2574",
+             "_3_r1_2573", "_10_r1_2577",
+             "_4_r1_2573", "_8_r1_2577")
+
+doubles_ID <- c("_5_r1_2572_10_r1_2573", 
+             "_6_r1_2572_9_r1_2574", 
+             "_7_r1_2572_8_r1_2575", 
+             "_8_r1_2572_3_r1_2579",
+             "_9_r1_2572_2_r1_2574", 
+             "_10_r1_2572_4_r1_1162",
+             "_2_r1_2573_8_r1_2574",
+             "_3_r1_2573_10_r1_2577",
+             "_4_r1_2573_8_r1_2577")
+```
+
+Now, select these cases from the dataset and correlate them with each other. The order follows the doublets - each 2 form a pair. 
+
+```{r}
+#| label: Double measurement correlation
+#| fig-cap: Correlation over the samples that were measured twice
+#| fig-width: 3
+#| fig-height: 3
+#| 
+doub_df <- df_wide_norm %>%
+  dplyr::select(one_of(doubles))
+
+cor_df <- doub_df %>%
+  cor(method = "spearman", use = "pairwise.complete.obs") %>%
+  as.data.frame() %>%
+  rownames_to_column("part1") %>%
+  pivot_longer(!part1, names_to = "part2", values_to = "R") %>%
+  unite("ID", c("part1", "part2"),  sep = "") %>%
+  dplyr::filter(ID %in% doubles_ID) %>%
+  mutate(cor = "coef")
+
+ggplot(cor_df, aes(cor, R)) +
+  geom_boxplot(fill = "#2a9d8f") +
+  cowplot::theme_cowplot() +
+  labs(y = "Spearman's R", x = "") +
+  ylim(0.8,1)
+
+```
+
+There is a very good correlation for all pairs of samples. The double measurement was only for quality control. Hence, we will only keep one of the doublets. This will be selected randomly. 
+
+```{r}
+vec_list <- list(
+  A = c("_5_r1_2572", "_10_r1_2573"), 
+  B = c("_6_r1_2572", "_9_r1_2574"), 
+  C = c("_7_r1_2572", "_8_r1_2575"), 
+  D = c("_8_r1_2572", "_3_r1_2579"),
+  E = c("_9_r1_2572", "_2_r1_2574"), 
+  `F` = c("_10_r1_2572", "_4_r1_1162"), 
+  G = c("_2_r1_2573", "_8_r1_2574"), 
+  I = c("_3_r1_2573", "_10_r1_2577"), 
+  J = c("_4_r1_2573", "_8_r1_2577")
+)
+
+rm_vec <- c()
+
+for(i in 1:length(names(vec_list))) {
+  
+  set.seed(069)
+  
+  rm_vec <- c(rm_vec, 
+                sample(vec_list[[i]], 1))
+  
+}
+
+
+```
+
+Now, remove these samples from the dataset
+
+```{r}
+df_wide_norm_upd <- df_wide_norm %>%
+  dplyr::select(-all_of(rm_vec))
+```
+
+
 ### HarmonizR correction
 
 Given the strong impact of the missing value pattern and the iRS sample selection, removing these batch effects might be necessary. To overcome this batch effect situation, I tried to utilize the batch-effect correction by "harmonizeR" (https://www.nature.com/articles/s41467-022-31007-x).
@@ -822,7 +913,7 @@ harmonize_df_parametric <- HarmonizR::harmonizR(
 ```{r}
 #| echo: false
 
-harmonize_df_parametric <- readRDS("20230106_harmonized.rds")
+harmonize_df_parametric <- readRDS("20230215_harmonized.rds")
 ```
 
 ```{r}
@@ -1061,10 +1152,15 @@ cohort_order <- t(df_lm_sc) %>%
   rownames_to_column("Prot_id") %>%
   filter(Prot_id %in% df_meta$prot_id)
 
+
+#to be consistent, lets read in the meta data
+df_meta <- read_csv("~/Library/CloudStorage/OneDrive-JohannWolfgangGoetheUniversität/For_others/di_Fonzo_Andrea/20230102_Glioblastoma_proteomics/20230106_glioblastoma_proteomics_shared/20230106_glioblastoma_meta_data.csv")
+
 df_meta <- df_meta %>%
   dplyr::slice(match(cohort_order$Prot_id, prot_id)) %>%
-  left_join(cluster_df, 
-            by = "prot_id")
+  separate(tmt_set_name_2, c("rm", "plex"), sep = "-", remove = FALSE)
+  # left_join(cluster_df, 
+  #           by = "prot_id")
 
 #define color space for creation of heatmap 
 color_fun_glio = colorRamp2(c(min(dt), 
@@ -1079,10 +1175,13 @@ color_fun_glio = colorRamp2(c(min(dt),
                                         "red4"))
 
 
+names(palette) <- unique(df_meta$plex)
+
 #create top annotation for heatmap
 coo_anno = HeatmapAnnotation(
   IDH_status = df_meta[[8]],
-  Cluster = df_meta[[14]],
+  Cluster = df_meta[[10]],
+  Plex = df_meta[[5]],
   col = list(
     IDH_status = c(
     "mut" = "#e76f51",
@@ -1095,13 +1194,14 @@ coo_anno = HeatmapAnnotation(
       "3" = "#06d6a0",
       "4" = "#118ab2", 
       "5" = "#073b4c"
-    )
+    ),
+    Plex = palette
 ))
 
 #plot heatmap with included hc and COO annotation
 ht <- Heatmap(as.matrix(dt),
               col = color_fun_glio,
-              column_split = data.frame(df_meta$value),
+              column_split = data.frame(df_meta$cluster),
               row_split = 5,
               column_title = " ",
               row_title = " ",
@@ -1120,6 +1220,117 @@ ht <- Heatmap(as.matrix(dt),
 ```
 
 The top row annotates the IDH status and the second row highlights the proteomics data-inferred clusters. The heatmap below represents the distance from each sample to each other sample in the proteomics data space.
+
+Now check, whether the cluster assignment is driven by the plexes
+
+```{r}
+library(caret)
+library(broom)
+
+df_meta <- df_meta %>%
+  mutate(cluster = as.factor(cluster),
+         plex = as.factor(plex))
+
+df_meta_clust <- cbind(model.matrix(~ 0 + df_meta$cluster), df_meta$plex) %>%
+  as.data.frame()
+
+colnames(df_meta_clust) <- c("clust1", "clust2", "clust3", "clust4", "clust5",  "plex")
+
+output_df <- data.frame(cluster = as.character(),
+                        pval = as.numeric())
+
+for(i in 1:5) {
+  
+  output_inner_df <- data.frame(cluster = as.character(1),
+                        pval = as.numeric(1))
+  
+  output_inner_df$cluster <- colnames(df_meta_clust)[i]
+  
+  output_inner_df$pval <- (tidy(fisher.test(df_meta_clust[,i], df_meta_clust$plex, simulate.p.value = TRUE)))$p.value
+  
+  output_df <- rbind(output_df, output_inner_df)
+}
+
+output_final <- output_df %>% 
+  mutate(padj = p.adjust(pval, "BH"))
+
+library(knitr)
+kable(output_final)
+
+```
+
+So there is a statistical association of each cluster. Lets investigate this further
+
+```{r}
+library(fastDummies)
+library(ggcorrplot)
+
+df_meta_clust2 <- df_meta_clust %>%
+    fastDummies::dummy_cols(select_columns = "plex", remove_selected_columns = T)
+
+output_df <- data.frame(cluster = as.character(),
+                              plex = as.character(),
+                              pval = as.numeric())
+
+for(i in 1:5) {
+  
+  output_inner_df <- data.frame(cluster = as.character(),
+                                plex = as.character(),
+                        pval = as.numeric())
+  
+  plex_vec <- colnames(df_meta_clust2[-c(1:5)])
+  
+  for(j in plex_vec) {
+    
+    output_innest_df <- data.frame(cluster = as.character(1),
+                                   plex = as.character(1),
+                                   pval = as.numeric(1))
+    
+    output_innest_df$plex <- j
+    
+    output_innest_df$cluster <- colnames(df_meta_clust2)[i]
+  
+    output_innest_df$pval <- (tidy(fisher.test(df_meta_clust2[,i], df_meta_clust2[,j])))$p.value
+  
+    output_inner_df <- rbind(output_inner_df, output_innest_df)
+    
+  }
+  
+  output_df <- rbind(output_df, output_inner_df)
+
+}
+
+
+output_df <- output_df %>%
+  mutate(padj = p.adjust(pval, "BH")) %>%
+  dplyr::select(cluster, plex, padj) %>%
+  pivot_wider(names_from = "plex", values_from = "padj") %>%
+  column_to_rownames("cluster") %>%
+  as.matrix()
+
+color_fun_pval = colorRamp2(c(1,0.06, 0.05,min(output_df)),
+                            c("grey","white","lightskyblue","navyblue"))
+                                     
+
+ht <- Heatmap(as.matrix(t(output_df)),
+              col = color_fun_pval,
+              #row_split = 5,
+              column_title = " ",
+              row_title = " ",
+              border = F,
+              show_row_dend = FALSE,
+              #column_gap = unit(c(0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0), "mm"),
+              show_column_dend = FALSE,
+              cluster_rows = FALSE,
+              cluster_columns = FALSE,
+              show_column_names = TRUE,
+              show_row_names = TRUE,
+              #bottom_annotation = clust_anno,
+              name = "FDR") %>%
+  draw(heatmap_legend_side = "right", annotation_legend_side ="bottom", merge_legend = TRUE)
+  
+
+```
 
 ### Cluster-wise gene-set enrichement analysis
 
@@ -1150,7 +1361,7 @@ Create the identifiers for differential testing
 
 ```{r}
 limma_ident <-  df_meta %>%
-  mutate(class = as.factor(value)) %>%
+  mutate(class = as.factor(cluster)) %>%
   mutate(batch = case_when(
     grepl("1097|1111|1129|1140|1150|1162|1177|1192", prot_id) ~ 2,
     grepl("2572|2573", prot_id) ~ 3,
@@ -1297,6 +1508,7 @@ Now, lets compare the pathways that are found to be enriched in the differential
 library(GSVA)
 
 df_imp <- readRDS("20230106_imputed_df.rds") %>%
+  dplyr::select(-one_of(rm_vec)) %>%
   rownames_to_column("uniprot_id")
 
 #generate final dataset
@@ -1431,7 +1643,7 @@ Export data
 
 ```{r}
 df_norm_uncorrected <- left_join(df_prot[,c(1,2)], 
-                     df_wide_norm, 
+                     df_wide_norm_upd, 
                      by = "uniprot_id") %>%
   separate(uniprot_id, c("uniprot_id", "rm"), sep = ";") %>%
   separate(gene_id, c("gene_id", "rm2"), sep = ";") %>%
@@ -1440,7 +1652,7 @@ df_norm_uncorrected <- left_join(df_prot[,c(1,2)],
 #transform to log2 
 df_norm_uncorrected[,-c(1,2)] <- log2(df_norm_uncorrected[,-c(1,2)])
 #save as csv
-write.csv(df_norm_uncorrected, "20230106_gioblastoma_proteome_norm_noBatchCorr.csv")
+write.csv(df_norm_uncorrected, "20230215_gioblastoma_proteome_norm_noBatchCorr.csv")
 
 
 
@@ -1455,15 +1667,32 @@ df_norm_batch_corrected <- left_join(df_prot[,c(1,2)],
 #transform to log2 
 df_norm_batch_corrected[,-c(1,2)] <- log2(df_norm_batch_corrected[,-c(1,2)])
 # save as csv
-write.csv(df_norm_batch_corrected, "20230106_gioblastoma_proteome_norm_withBatchCorr.csv")
+write.csv(df_norm_batch_corrected, "20230215_gioblastoma_proteome_norm_withBatchCorr.csv")
 
 
 #export meta data 
-df_exp <- df_meta %>%
-  dplyr::select(label, tmt_set_name_2, patient, proteomic_id, idh_wt, prot_id)
+df_exp <- df_meta %>% 
+  dplyr::rename(c("cluster" = "value")) %>%
+  dplyr::select(label, tmt_set_name_2, patient, proteomic_id, idh_wt, prot_id, cluster)
 
 #save as csv
-write.csv(df_exp, "20230106_glioblastoma_meta_data.csv")
+write.csv(df_exp, "20230215_glioblastoma_meta_data.csv")
+```
+
+There is an unclear situation of duplicated samples in the meta data
+
+```{r}
+df_meta_dupl <- df_meta %>%
+  dplyr::select(-rm) %>%
+  separate(patient, c("patient_id", "block"), sep = "-", remove = FALSE)
+
+dupl_vec <- 
+
+duplicated <- df_meta_dupl$patient_id[base::duplicated(df_meta_dupl$patient_id)] 
+
+dupl_meta <- df_meta_dupl %>%
+  filter(patient_id %in% duplicated) %>%
+  arrange(desc(patient))
 ```
 
 ### Session information
