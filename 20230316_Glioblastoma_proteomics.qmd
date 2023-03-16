@@ -1,0 +1,1718 @@
+---
+title: "20230106_Glioblastoma_proteomics"
+format: 
+  html : 
+    code-fold: true
+editor: visual
+date: "`r Sys.Date()`"
+knitr:
+  opts_chunk:
+    message: false
+    warning: false
+---
+
+## Introduction
+
+Global proteome expression data was generated from primary FFPE glioblastoma samples by Andrea Di Fonzo PhD using a TMT-10-plex approach. Here, one label/channel per plex served as a reference-channel that was later used for the inter-plex normalization. The below generated report for the normalization is also available in the public github repository within the Oellerich Lab github: <https://github.com/Oellerich-Lab/Glioblastoma_proteomics>
+
+## Methods
+
+To perform normalization on the generated global proteome expression data, the internal-reference-scaling method (IRS) was used. In brief, this method initially corrects for sample loading differences within each plex and in a second step uses the present reference samples/channels that are the same across all plexes for normalization between all plexes. A good tutorial and theoretical summary for applying this method can be found here: <https://pwilmart.github.io/IRS_normalization/>.
+
+## Report
+
+### Setup
+
+```{r}
+library(tidyverse)
+library(cowplot)
+
+#create not in function 
+`%not_in%` <- purrr::negate(`%in%`)
+```
+
+First, load the meta data provided by Andrea di Fonzo and inspect the top of the data.
+
+```{r}
+df_meta <- readxl::read_excel("Samples-List_Labellin_221205 (1).xlsx", sheet = 2) %>%
+  janitor::clean_names()
+
+head(df_meta)
+```
+
+Second, load the raw data and inspect the top of the data
+
+```{r}
+df_prot <- readxl::read_excel("~/Library/CloudStorage/OneDrive-JohannWolfgangGoetheUniversität/For_others/di_Fonzo_Andrea/20230102_Glioblastoma_proteomics/proteinGroups_Filtered (1).xlsx")%>%
+  janitor::clean_names()
+
+```
+
+The raw data represents the output from the MaxQuant <https://www.maxquant.org/> search of the raw MS spectra from the MS/MS measurement. It has been already corrected for missidentified and only reverse identified peptides.
+
+To further work with the data, we only need the uniprot_id, gene_name and corrected reporter intensity information. So, the df will be subsetted for this data.
+
+```{r}
+df_prot <- df_prot %>%
+  dplyr::select(majority_protein_i_ds, gene_names, contains("reporter_intensity_corrected")) %>%
+  dplyr::rename("uniprot_id" = "majority_protein_i_ds") %>%
+  dplyr::rename("gene_id" = "gene_names") %>%
+  dplyr::rename_with(.cols = -c("uniprot_id", "gene_id"), .fn = ~ stringr::str_remove(string = ., "reporter_intensity_corrected"))
+```
+
+Quick check for the number of missing values.
+
+```{r}
+#convert NaN to NA
+df_prot[df_prot == "NaN"] <- NA_integer_
+
+#convert Zero values to NA
+df_prot[,-c(1:2)][df_prot[,-c(1:2)] == "0"] <- NA_integer_
+
+#remove rows with only NA
+df_prot <- df_prot %>%
+  filter(rowSums(is.na(df_prot[,-c(1:2)])) != ncol(df_prot[,-c(1:2)]))
+
+print(paste("Total number of missing values: ", sum(is.na(df_prot))))
+```
+
+Check for duplicates in features and samples.
+
+```{r}
+print(paste("Number of duplicated features: ", sum(duplicated(df_prot$uniprot_id))))
+
+print(paste("Number of duplicated samples: ", sum(duplicated(colnames(df_prot[,-c(1:2)])))))
+
+
+```
+
+### Missing value pattern
+
+In TMT-measured experiments, there occurs missing data and the missing data patterns is usually present not-at-random. So, lets quickly investigate the number of missing values and also the number of identified proteins per sample.
+
+```{r}
+#| eval: false
+
+#combine both replicates 
+df_long <- cbind(
+  df_prot %>%
+    dplyr::select(uniprot_id, contains("r1")) %>%
+    tidyr::pivot_longer(!uniprot_id,
+                        names_to = "Prot_id1",
+                        values_to = "count_R1"),
+  df_prot %>%
+    dplyr::select(uniprot_id, contains("r2")) %>%
+    tidyr::pivot_longer(!uniprot_id,
+                        names_to = "Prot_id2",
+                        values_to = "count_R2") %>%
+    dplyr::select(-uniprot_id)
+    
+) %>%
+  rowwise() %>%
+  dplyr::mutate(avg_count = mean(c_across(cols = c(count_R1, count_R2)), na.rm = TRUE))
+
+#reformat the NA 
+df_long$avg_count[df_long$avg_count == "NaN"] <- NA_integer_
+```
+
+```{r}
+#| echo: false 
+
+df_long <- readRDS("20230102_df_long.rds")
+```
+
+Visualize the numbers of missing values per sample
+
+```{r}
+#| fig-cap: Sample-wise percentage of missing values
+#| fig-width: 12
+#| fig-height: 4
+
+comb1 <- df_long %>%
+  group_by(Prot_id1) %>%
+  summarise(na_rate = sum(is.na(avg_count))) %>%
+  mutate(Prot_id2 = Prot_id1) %>%
+  separate(Prot_id2, c("remove", "Plex"), sep = "r1_") %>%
+  mutate(na_perc = na_rate / nrow(df_prot)) 
+
+ggplot(comb1, aes(
+    x = forcats::fct_reorder(Prot_id1, na_perc),
+    y = na_perc,
+    fill = Plex
+  )) +
+  geom_col() +
+  theme_cowplot() +
+  labs(x = "Prot_id", y = "[%] of proteins missing") +
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line.y =  element_line(colour = "black"),
+    axis.line.x =  element_line(colour = "black"),
+    axis.text.y = element_text(colour = "black"),
+    legend.title = element_blank(),
+    axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    ),
+    legend.position = "none"
+  ) 
+```
+
+As double-checked by Andrea, the channels 6-10 in plex 1192 did not contain any samples, hence they are just measured as artifacts. So, they have to bee removed in both replicates.
+
+```{r}
+df_prot <- df_prot %>%
+  dplyr::select(-contains(c("_6_r1_1192", "_7_r1_1192", "_8_r1_1192", "_9_r1_1192", "_10_r1_1192",
+                          "_6_r2_1192", "_7_r2_1192", "_8_r2_1192", "_9_r2_1192", "_10_r2_1192")))
+```
+
+```{r}
+#| fig-cap: Sample-wise percentage of missing values
+#| fig-width: 12
+#| fig-height: 4
+
+library(randomcoloR)
+
+plex_vec <- unique(
+  stringr::str_remove(
+    colnames(df_prot[,-c(1,2)]), 
+    "_._r1_|_._r2_|_.._r1_|_.._r2_")
+  ) 
+
+palette <- distinctColorPalette(length(plex_vec))
+
+comb <- df_long %>% 
+  dplyr::filter(Prot_id1 %in% colnames(df_prot[,-1])) %>%
+  group_by(Prot_id1) %>%
+  summarise(na_rate = sum(is.na(avg_count))) %>%
+  mutate(Prot_id2 = Prot_id1) %>%
+  separate(Prot_id2, c("remove", "Plex"), sep = "r1_") %>%
+  mutate(na_perc = na_rate / nrow(df_prot)) 
+
+ggplot(comb, aes(
+    x = forcats::fct_reorder(Prot_id1, na_perc),
+    y = na_perc,
+    fill = Plex
+  )) +
+  geom_col() +
+  theme_cowplot() +
+  labs(x = "Prot_id", y = "[%] of proteins missing") +
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line.y =  element_line(colour = "black"),
+    axis.line.x =  element_line(colour = "black"),
+    axis.text.y = element_text(colour = "black"),
+    legend.title = element_blank(),
+    axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    ),
+    legend.position = "none"
+  )  +
+  scale_fill_manual(values = palette)
+```
+
+Print the metrics for missing values
+
+```{r}
+print(paste("Total number of proteins identified:", nrow(df_prot), sep = " "))
+
+print(paste("Median number of proteins identified per sample:", nrow(df_prot) - median(comb$na_rate), sep = " "))
+
+print(paste("Minimum number of proteins identified per sample:", nrow(df_prot) - max(comb$na_rate), sep = " "))
+
+print(paste("Maximum number of proteins identified per sample:", nrow(df_prot) - min(comb$na_rate), sep = " "))
+```
+
+### Replicate correlation
+
+Each plex was measured in two technical replicates, so we investigate the correlation between both replicates
+
+```{r}
+#| label: Replicate_correlation
+#| fig-cap: Sample-wise correlation over the technical replicates
+#| fig-width: 5
+#| fig-height: 4
+
+library(ComplexHeatmap)
+library(circlize)
+
+R1 <- df_prot %>%
+  dplyr::select(contains("r1"))
+
+R2 <- df_prot %>%
+  dplyr::select(contains("r2"))
+
+#set the color-vector 
+color_fun_corr = colorRamp2(c(-1, 0, 1), c("blue", "white", "red"))
+
+cor(R1, R2, method = "spearman", use = "pairwise.complete.obs") %>%
+  Heatmap(as.matrix(.),
+                   column_title = "Replicate 1",
+                   row_title = "Replicate 2",
+                   col = color_fun_corr,
+                   show_row_names = FALSE,
+                   show_column_names = FALSE,
+                   cluster_rows = FALSE,
+                   cluster_columns = FALSE,
+                   name = "Spearman's R") %>%
+  draw()
+```
+
+### Reference channel correlation
+
+There is a high correlation over the replicates. So, in a next step lets correlate the measured intensities over the reference channel.
+
+```{r}
+#| label: Reference_channel_correlation
+#| fig-cap: Correlation over the reference channels
+#| fig-width: 4
+#| fig-height: 4
+
+df_wide <- df_long %>%
+  dplyr::select(c("uniprot_id", "Prot_id1", "avg_count")) %>%
+  pivot_wider(names_from = "Prot_id1", values_from = avg_count)
+
+#first, compute the reference-channel correlation 
+ref_cor <- df_wide %>%
+  dplyr::select(starts_with("_1_")) %>%
+  cor(., method = "spearman", use = "pairwise.complete.obs") %>%
+  as.data.frame() %>%
+  mutate(type = "ref") %>%
+  pivot_longer(!c(type), names_to = "Prot_id", values_to = "count") %>%
+  filter(count != 1)
+
+ref_cor <- ref_cor[duplicated(ref_cor$count),]
+
+ggplot(ref_cor, aes(count)) +
+  geom_density(fill = "#2a9d8f") +
+  cowplot::theme_cowplot() +
+  labs(x = "Spearman's R" ) 
+
+```
+
+There seems to be a fair correlation for the reference channels.
+
+### Raw data distribution
+
+Inspect how the data is distributed without any correction.
+
+```{r}
+#| fig-cap: Raw intensity distribution per sample
+#| fig-width: 14
+#| fig-height: 10
+
+order_vec <- colnames(df_prot[,-c(1:2)])
+
+
+plot_grid(
+  df_prot %>%
+    dplyr::select(-gene_id) %>%
+    pivot_longer(!uniprot_id, names_to = "Prot_id", values_to = "intensity") %>%
+    mutate(splitter = Prot_id) %>%
+    separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+    filter(grepl("_r1_", Prot_id)) %>%
+    ggplot(aes(
+      factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+    )) +
+    geom_boxplot() +
+    theme_cowplot() +
+    theme(axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    )) +
+    labs(x = "", y = "log2(intensity)", title = "Replicate 1") +
+    scale_fill_manual(values = palette),
+  
+  df_prot %>%
+    dplyr::select(-gene_id) %>%
+    pivot_longer(!uniprot_id, names_to = "Prot_id", values_to = "intensity") %>%
+    mutate(splitter = Prot_id) %>%
+    separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+    filter(grepl("_r2_", Prot_id)) %>%
+    ggplot(aes(
+      factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+    )) +
+    geom_boxplot() +
+    theme_cowplot() +
+    theme(axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    )) +
+    labs(x = "", y = "log2(intensity)", title = "Replicate 2") +
+    scale_fill_manual(values = palette),
+  
+  nrow = 2
+)
+
+```
+
+### Sample loading normalization
+
+In the first step, we normalize within each plex by creating a normalization factor from a global scaling value (median of all column sums) divided by each samples column sum.
+
+```{r}
+#| fig-cap: Sample-loading normalized intensity distribution per sample
+#| fig-width: 14
+#| fig-height: 10
+
+## create a vector of plexes
+plex_vec <- unique(
+  stringr::str_remove(
+    colnames(df_prot[,-c(1,2)]), 
+    "_._r1_|_._r2_|_.._r1_|_.._r2_")
+  ) 
+
+
+# Store each plex into a list embedment
+plex_list <- list() 
+for(i in plex_vec) {
+  
+  plex_list[[i]] <- df_prot %>% 
+    dplyr::select(contains(i))
+  
+}
+
+#create the target scaling factor 
+colsum_vec <- c() 
+
+for(i in plex_vec) {
+  
+  df <- plex_list[[i]]
+  
+  colsum_vec <- c(colsum_vec, colSums(df, na.rm = TRUE))
+  
+}
+
+target <- median(colsum_vec, na.rm = TRUE)
+
+#correct per plex with a helper function
+run_sl_correct <- function(Y) {
+  norm_facs <- target / colSums(Y, na.rm = TRUE)
+  output_sl <- sweep(Y, 2, norm_facs, FUN = "*")
+  
+  return(output_sl)
+}
+
+data_sl_repl <- plex_list%>%
+  purrr::map(run_sl_correct) %>% 
+  bind_cols()
+
+
+#Visualize the output 
+plot_grid(
+  data_sl_repl %>%
+    rownames_to_column("n") %>%
+    pivot_longer(!n, names_to = "Prot_id", values_to = "intensity") %>%
+    mutate(splitter = Prot_id) %>%
+    separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+    filter(grepl("_r1_", Prot_id)) %>%
+    ggplot(aes(
+      factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+    )) +
+    geom_boxplot() +
+    theme_cowplot() +
+    theme(axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    )) +
+    labs(x = "", y = "log2(intensity)", title = "Replicate 1") +
+    scale_fill_manual(values = palette),
+  
+  data_sl_repl %>%
+    rownames_to_column("n") %>%
+    pivot_longer(!n, names_to = "Prot_id", values_to = "intensity") %>%
+    mutate(splitter = Prot_id) %>%
+    separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+    filter(grepl("_r2_", Prot_id)) %>%
+    ggplot(aes(
+      factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+    )) +
+    geom_boxplot() +
+    theme_cowplot() +
+    theme(axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    )) +
+    labs(x = "", y = "log2(intensity)", title = "Replicate 2") +
+    scale_fill_manual(values = palette),
+  
+  nrow = 2
+)
+```
+
+Lets also check for the correlation between the random set of channels
+
+```{r}
+#| fig-cap: Correlation of samples
+#| fig-width: 6
+#| fig-height: 6
+library(psych)
+
+sl_test_data <- data_sl_repl %>%
+  dplyr::select(contains("r1")) %>%
+  dplyr::select(contains(plex_vec[1:6])) %>%
+  dplyr::select(contains("_10_"))
+pairs.panels(log2(sl_test_data), lm = TRUE, main = "Random channel over plexes SL")
+```
+
+There is a fair amount of correlation, but still with room for improvement. Let's further have a look into the general structure in the dataset by PCA. Since we are working with a dataset that contains missing data, we probabilistic PCA (pPCA) that accounts for missing data <http://www.cs.columbia.edu/~blei/seminar/2020-representation/readings/TippingBishop1999.pdf>.
+
+```{r}
+#| fig-cap: Probabilistic PCA after sample loading normalization
+#| fig-width: 5
+#| fig-height: 4
+
+library(pcaMethods)
+library(scrime)
+
+threshold <- 0.5
+ppca_df <- data_sl_repl %>% 
+  filter(rowMeans(is.na(.)) < threshold) %>%
+  #feature-wise scaling and centering 
+  rowScales() %>%
+  as.data.frame()
+
+data_ppca <- pcaMethods::pca(t(as.matrix(ppca_df)), method = "ppca", nPcs = 2, seed = 123)
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  separate(Prot_id, c("Number", "Plex"), sep = "_r1_|_r2_")
+
+ggplot(ppca_out, aes(PC1, PC2, col = Plex)) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = palette) +
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)"))
+```
+
+The replicates fall together and the plexes are somewhat close to each other, however there is still a clear separation in the dataset.
+
+### Internal reference scaling
+
+Here, we use the reference factors, to create a protein- and reference channel wise scaling factor, that brings the proteins over all samples into a similar range.
+
+```{r}
+#| fig-cap: Sample-loading and internal reference scaling normalized intensity distribution per sample
+#| fig-width: 14
+#| fig-height: 10
+#| 
+#make a dataframe of the reference channels per plex 
+irs_factors <- data_sl_repl %>% 
+  dplyr::select(contains("_1_"))
+#calculate the geometric mean per sample 
+irs_factors$geomean <- apply(irs_factors, 1, function(x) exp(mean(log(x), na.rm = TRUE)))
+#pull out sample names to identify  !!! Adjust removal position to geomeam column
+irs_factor_vec = as.vector(names(irs_factors[,-c((length(plex_vec)*2)+1)]))
+#create the protein and reference channel wise scaling factor
+for(i in irs_factor_vec) {
+  factor <-  irs_factors$geomean / (irs_factors %>% dplyr::select(i))
+  irs_factors[,paste0("fac_",i)] <- factor
+}
+
+irs_mult <- colnames(irs_factors %>% dplyr::select(contains("fac"))) %>% as.data.frame
+
+irs_mult <- cbind(irs_mult, irs_mult) 
+
+colnames(irs_mult) <- c("factor", "exp")
+
+irs_mult<- irs_mult %>%
+  separate(exp, c("discard", "plex"), sep = "\\_1_") %>%
+  dplyr::select(-discard) %>% 
+  filter(plex != "r1_1097")
+
+irs_mult_vec = as.vector(irs_mult$plex)
+
+irs_fac_filt <- irs_factors %>% dplyr::select(contains("fac"))
+
+all_irs <- (data_sl_repl %>% dplyr::select(contains("r1_1097"))) * unlist(irs_fac_filt %>% dplyr::select(contains("r1_1097")))
+
+for(i in irs_mult_vec) {
+  all_irs <- cbind(all_irs, (data_sl_repl %>% dplyr::select(contains(i))) * unlist(irs_fac_filt %>% dplyr::select(contains(i))))
+}
+
+#Visualize the output
+
+#Visualize the output 
+plot_grid(
+  all_irs %>%
+    rownames_to_column("n") %>%
+    pivot_longer(!n, names_to = "Prot_id", values_to = "intensity") %>%
+    mutate(splitter = Prot_id) %>%
+    separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+    filter(grepl("_r1_", Prot_id)) %>%
+    ggplot(aes(
+      factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+    )) +
+    geom_boxplot() +
+    theme_cowplot() +
+    theme(axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    )) +
+    labs(x = "", y = "log2(intensity)", title = "Replicate 1") +
+    scale_fill_manual(values = palette),
+  
+  all_irs %>%
+    rownames_to_column("n") %>%
+    pivot_longer(!n, names_to = "Prot_id", values_to = "intensity") %>%
+    mutate(splitter = Prot_id) %>%
+    separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+    filter(grepl("_r2_", Prot_id)) %>%
+    ggplot(aes(
+      factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+    )) +
+    geom_boxplot() +
+    theme_cowplot() +
+    theme(axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    )) +
+    labs(x = "", y = "log2(intensity)", title = "Replicate 2") +
+    scale_fill_manual(values = palette),
+  
+  nrow = 2
+)
+```
+
+Lets also check for the correlation between the random set of channels
+
+```{r}
+#| fig-cap: Correlation of samples
+#| fig-width: 6
+#| fig-height: 6
+
+sl_test_data <- all_irs %>%
+  dplyr::select(contains("r1")) %>%
+  dplyr::select(contains(plex_vec[1:6])) %>%
+  dplyr::select(contains("_10_"))
+pairs.panels(log2(sl_test_data), lm = TRUE, main = "Random channel over plexes SL")
+```
+
+This correlation looks well improved. Lets also investigate the pPCA.
+
+```{r}
+#| fig-cap: Probabilistic PCA after sample loading normalization and internal reference scaling (IRS)
+#| fig-width: 5
+#| fig-height: 4
+
+ppca_df <- all_irs %>% 
+  filter(rowMeans(is.na(.)) < threshold) %>%
+  #feature-wise scaling and centering 
+  rowScales() %>%
+  as.data.frame()
+
+data_ppca <- pcaMethods::pca(t(as.matrix(ppca_df)), method = "ppca", nPcs = 2, seed = 123)
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  separate(Prot_id, c("Number", "Plex"), sep = "_r1_|_r2_")
+
+ggplot(ppca_out, aes(PC1, PC2, col = Plex)) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = palette) +
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)"))
+```
+
+The replicates still fall together, but the overall structure improved: no more separation into two blocks and certain "spreading" of the individual samples.
+
+### Merge replicates by average
+
+```{r}
+#| eval: false
+
+df_prot_norm <- cbind(df_prot[,c(1)], all_irs) %>%
+  dplyr::select(-contains("_1_"))
+
+df_long_norm <- cbind(
+  df_prot_norm %>%
+    dplyr::select(uniprot_id, contains("r1")) %>%
+    tidyr::pivot_longer(!uniprot_id,
+                        names_to = "Prot_id1",
+                        values_to = "count_R1"),
+  df_prot_norm %>%
+    dplyr::select(uniprot_id, contains("r2")) %>%
+    tidyr::pivot_longer(!uniprot_id,
+                        names_to = "Prot_id2",
+                        values_to = "count_R2") %>%
+    dplyr::select(-uniprot_id)
+  
+) %>%
+  rowwise() %>%
+  dplyr::mutate(avg_count = mean(c_across(cols = c(count_R1, count_R2)), na.rm = TRUE))
+
+#reformat the NA 
+df_long_norm$avg_count[df_long_norm$avg_count == "NaN"] <- NA_integer_
+
+df_wide_norm <- df_long_norm %>% 
+  dplyr::select(uniprot_id, Prot_id1, avg_count) %>%
+  pivot_wider(names_from = "Prot_id1", values_from = "avg_count")
+```
+
+```{r}
+#| echo: false 
+
+df_wide_norm <- readRDS("20230106_df_wide_norm.rds")
+```
+
+### Final data investigation
+
+First, visualize the distribution per sample
+
+```{r}
+#| fig-cap: Sample-loading and internal reference scaling normalized intensity distribution per sample after mean merge of replicates
+#| fig-width: 14
+#| fig-height: 5
+
+df_wide_norm[,-1] %>%
+    rownames_to_column("n") %>%
+    pivot_longer(!n, names_to = "Prot_id", values_to = "intensity") %>%
+    mutate(splitter = Prot_id) %>%
+    separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+    filter(grepl("_r1_", Prot_id)) %>%
+    ggplot(aes(
+      factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+    )) +
+    geom_boxplot() +
+    theme_cowplot() +
+    theme(axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    )) +
+    labs(x = "", y = "log2(intensity)") +
+    scale_fill_manual(values = palette)
+```
+
+```{r}
+#| fig-cap: Probabilistic PCA after sample loading normalization and IRS plus mean merged for replicates
+#| fig-width: 5
+#| fig-height: 4
+
+ppca_df <- df_wide_norm[,-1] %>% 
+  filter(rowMeans(is.na(.)) < threshold) %>%
+  #feature-wise scaling and centering 
+  rowScales() %>%
+  as.data.frame()
+
+data_ppca <- pcaMethods::pca(t(as.matrix(ppca_df)), method = "ppca", nPcs = 2, seed = 123)
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  separate(Prot_id, c("Number", "Plex"), sep = "_r1_|_r2_")
+
+ggplot(ppca_out, aes(PC1, PC2, col = Plex)) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = palette) +
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)"))
+```
+
+Check, how the missing value pattern affects the global data structure
+
+```{r}
+#| fig-cap: Probabilistic PCA of final dataset colored for missing value rate 
+#| fig-width: 5
+#| fig-height: 4
+
+comb_df <- comb %>%
+  dplyr::select(Plex, na_perc) %>%
+  group_by(Plex) %>%
+  summarise(na = mean(na_perc))
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  separate(Prot_id, c("Number", "Plex"), sep = "_r1_|_r2_") %>%
+  left_join(comb_df, 
+            by = "Plex")
+
+ggplot(ppca_out, aes(PC1, PC2, col = na)) +
+  geom_point(size = 3) +
+  scale_color_viridis_c()+
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)")) +
+  labs(color = "% missing")
+```
+
+There seems to be a clear separation on the basis of the missing value pattern. Additionally, there is a segregation visible in the PC2. Only a fraction of the samples have been used to generate the internal reference scaling standard (iST). Hence, check how these samples fall in the global structure of the probabilistic PCA.
+
+```{r}
+#| fig-cap: Probabilistic PCA of final dataset colored iST defining samples
+#| fig-width: 5
+#| fig-height: 4
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  mutate(iST = case_when( 
+    grepl("2572", Prot_id) ~ "iST", 
+    Prot_id %in% c("_2_r1_2573", "_3_r1_2573", "_4_r1_2573", "_5_r1_2573", "_6_r1_2573", "_7_r1_2573") ~ "iST", 
+    TRUE ~ "no iST"))
+
+ggplot(ppca_out, aes(PC1, PC2, col = iST)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("red", "grey"))+
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)")) +
+  labs(color = "")
+```
+
+Together, there is a strong influence of the missing value pattern as well as the sample choice for the iST generation on the overall data structure.
+
+### Double measurements 
+
+Some samples were measured twice to have a sort of internal control for the measurement. Let's investigate, how well these samples correlate. First, generate a vector with the respective sample names. 
+
+```{r}
+doubles <- c("_5_r1_2572", "_10_r1_2573", 
+             "_6_r1_2572", "_9_r1_2574", 
+             "_7_r1_2572", "_8_r1_2575", 
+             "_8_r1_2572", "_3_r1_2579",
+             "_9_r1_2572", "_2_r1_2574", 
+             "_10_r1_2572", "_4_r1_1162",
+             "_2_r1_2573", "_8_r1_2574",
+             "_3_r1_2573", "_10_r1_2577",
+             "_4_r1_2573", "_8_r1_2577")
+
+doubles_ID <- c("_5_r1_2572_10_r1_2573", 
+             "_6_r1_2572_9_r1_2574", 
+             "_7_r1_2572_8_r1_2575", 
+             "_8_r1_2572_3_r1_2579",
+             "_9_r1_2572_2_r1_2574", 
+             "_10_r1_2572_4_r1_1162",
+             "_2_r1_2573_8_r1_2574",
+             "_3_r1_2573_10_r1_2577",
+             "_4_r1_2573_8_r1_2577")
+```
+
+Now, select these cases from the dataset and correlate them with each other. The order follows the doublets - each 2 form a pair. 
+
+```{r}
+#| label: Double measurement correlation
+#| fig-cap: Correlation over the samples that were measured twice
+#| fig-width: 3
+#| fig-height: 3
+#| 
+doub_df <- df_wide_norm %>%
+  dplyr::select(one_of(doubles))
+
+cor_df <- doub_df %>%
+  cor(method = "spearman", use = "pairwise.complete.obs") %>%
+  as.data.frame() %>%
+  rownames_to_column("part1") %>%
+  pivot_longer(!part1, names_to = "part2", values_to = "R") %>%
+  unite("ID", c("part1", "part2"),  sep = "") %>%
+  dplyr::filter(ID %in% doubles_ID) %>%
+  mutate(cor = "coef")
+
+ggplot(cor_df, aes(cor, R)) +
+  geom_boxplot(fill = "#2a9d8f") +
+  cowplot::theme_cowplot() +
+  labs(y = "Spearman's R", x = "") +
+  ylim(0.8,1)
+
+```
+
+There is a very good correlation for all pairs of samples. The double measurement was only for quality control. Hence, we will only keep one of the doublets. This will be selected randomly. 
+
+```{r}
+vec_list <- list(
+  A = c("_5_r1_2572", "_10_r1_2573"), 
+  B = c("_6_r1_2572", "_9_r1_2574"), 
+  C = c("_7_r1_2572", "_8_r1_2575"), 
+  D = c("_8_r1_2572", "_3_r1_2579"),
+  E = c("_9_r1_2572", "_2_r1_2574"), 
+  `F` = c("_10_r1_2572", "_4_r1_1162"), 
+  G = c("_2_r1_2573", "_8_r1_2574"), 
+  I = c("_3_r1_2573", "_10_r1_2577"), 
+  J = c("_4_r1_2573", "_8_r1_2577")
+)
+
+rm_vec <- c()
+
+for(i in 1:length(names(vec_list))) {
+  
+  set.seed(069)
+  
+  rm_vec <- c(rm_vec, 
+                sample(vec_list[[i]], 1))
+  
+}
+
+```
+
+```{r}
+#| echo: false
+
+rm_vec <- readRDS("20230316_rm_vec.rds")
+
+```
+
+During the analysis of the data, Katharina mentioned that 3 patients were documented as not matching the criteria of inclusion for further analysis. Remove these as well: 
+
+```{r}
+rm_vec <- c(rm_vec, "_9_r1_1111", "_9_r1_1129", "_2_r1_2577")
+```
+
+Now, remove these samples from the dataset
+
+```{r}
+df_wide_norm_upd <- df_wide_norm %>%
+  dplyr::select(-all_of(rm_vec))
+```
+
+
+### HarmonizR correction
+
+Given the strong impact of the missing value pattern and the iRS sample selection, removing these batch effects might be necessary. To overcome this batch effect situation, I tried to utilize the batch-effect correction by "harmonizeR" (https://www.nature.com/articles/s41467-022-31007-x).
+
+First, create the batch vector information
+
+```{r}
+#| eval: false
+
+batch_df <- tibble(samplename = colnames(df_wide_norm[,-1])) %>%
+  rowid_to_column("ID") %>%
+  relocate(ID, .after = samplename) %>%
+  mutate(batch = case_when(
+    grepl("1097|1111|1129|1140|1150|1162|1177|1192", samplename) ~ 2,
+    grepl("2572|2573", samplename) ~ 3,
+    TRUE ~ 1
+  ))
+```
+
+Next, run the HarmonizR framework. Since this is computationally intensive, it was run on a cluster and loaded afterwards
+
+```{r}
+#| eval: false
+
+library(HarmonizR)
+
+harmonize_df <- df_wide_norm %>%
+  column_to_rownames("uniprot_id")
+
+harmonize_df_parametric <- HarmonizR::harmonizR(
+  data_as_input = harmonize_df, 
+  description_as_input = batch_df, 
+  algorithm = "ComBat", 
+  ComBat_mode = 3,
+  plot = "samplemeans"
+)
+```
+
+```{r}
+#| echo: false
+
+harmonize_df_parametric <- readRDS("20230215_harmonized.rds") %>%
+  dplyr::select(-all_of(c( "_9_r1_1111", "_9_r1_1129", "_2_r1_2577")))
+```
+
+```{r}
+#| fig-cap: Probabilistic PCA after HarmonizR-based batch correction 
+#| fig-width: 5
+#| fig-height: 4
+
+ppca_df <- harmonize_df_parametric %>% 
+  filter(rowMeans(is.na(.)) < threshold) %>%
+  #feature-wise scaling and centering 
+  rowScales() %>%
+  as.data.frame()
+
+data_ppca <- pcaMethods::pca(t(as.matrix(ppca_df)), method = "ppca", nPcs = 2, seed = 123)
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  separate(Prot_id, c("Number", "Plex"), sep = "_r1_|_r2_")
+
+ggplot(ppca_out, aes(PC1, PC2, col = Plex)) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = palette) +
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)"))
+```
+
+Check, how the missing value pattern affects the global data structure
+
+```{r}
+#| fig-cap: Probabilistic PCA after HarmonizR approach colored for % of missing values 
+#| fig-width: 5
+#| fig-height: 4
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  separate(Prot_id, c("Number", "Plex"), sep = "_r1_|_r2_") %>%
+  left_join(comb_df, 
+            by = "Plex")
+
+ggplot(ppca_out, aes(PC1, PC2, col = na)) +
+  geom_point(size = 3) +
+  scale_color_viridis_c()+
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)")) +
+  labs(color = "% missing")
+```
+
+There seems to be a removal of the impact of the missing value pattern on the data. Now, check how the iST-defining samples are located.
+
+```{r}
+#| fig-cap: Probabilistic PCA after HarmonizR correction colored iST defining samples
+#| fig-width: 5
+#| fig-height: 4
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  mutate(iST = case_when( 
+    grepl("2572", Prot_id) ~ "iST", 
+    Prot_id %in% c("_2_r1_2573", "_3_r1_2573", "_4_r1_2573", "_5_r1_2573", "_6_r1_2573", "_7_r1_2573") ~ "iST", 
+    TRUE ~ "no iST"))
+
+ggplot(ppca_out, aes(PC1, PC2, col = iST)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("red", "grey"))+
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)")) +
+  labs(color = "")
+```
+
+Since we have certain metadata for the IDH mutation data, check how IDH mutant samples distribute in the dataset
+
+```{r}
+#| fig-cap: Probabilistic PCA after HarmonizR correction colored iST defining samples
+#| fig-width: 5
+#| fig-height: 4
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("prot_id") %>%
+  left_join(df_meta %>%
+              dplyr::select(prot_id, idh_wt), 
+            by = "prot_id")
+
+ggplot(ppca_out, aes(PC1, PC2, col = factor(idh_wt))) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c( "#e76f51", "#2a9d8f"))+
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)")) +
+  labs(color = "IDH status")
+```
+
+PC2 seems to represent certain structure regarding the IDH mutation status. Hence, I inspected the loadings for PC2. Note that I am interested in characterizing loadings, that associate with IDH mutate status. Since IDH mut cases are found mostly in the negative fraction of PC2, I inverted the loadings presign.
+
+```{r}
+#| fig-cap: GSEA for PC2 loadings that correspond to IDH mutant status
+#| fig-width: 14
+#| fig-height: 7
+
+library(fgsea)
+
+ppca_loadings <- loadings(data_ppca) %>%
+  as.data.frame() %>%
+  rownames_to_column("uniprot_id") %>%
+  left_join(df_prot[,c(1,2)], by = "uniprot_id") %>%
+  separate(gene_id, c("gene_id", "rem"), sep = ";") %>%
+  dplyr::select(-rem) %>%
+  mutate(PC2 = PC2 * (-1))
+
+#generate ranked gene vector 
+pc2_vec <- ppca_loadings %>%
+  dplyr::select(gene_id, PC2) %>%
+  arrange(desc(PC2)) %>%
+  distinct(gene_id, .keep_all = TRUE) %>%
+  deframe()
+
+#load the go database
+pathways_go <- gmtPathways("/Users/juliusenssle/Library/CloudStorage/OneDrive-JohannWolfgangGoetheUniversität/2021_DLBCL_proteogenomics/GSEA_gene_sets/c5.go.v7.4.symbols.gmt")
+
+#run the fgsea
+fgsea_res_go <-
+    fgseaMultilevel(
+      pathways = pathways_go,
+      stats = pc2_vec,
+      minSize = 15,
+      maxSize = 500
+    )
+
+#filter for top and bottom enriched pathways 
+fgsea_res_filt_go <-
+    fgsea_res_go  %>%
+    as_tibble() %>%
+    drop_na(padj) %>%
+    filter(padj <= 0.01) %>%
+    dplyr::select(pathway, pval, padj, NES, size) %>%
+    arrange(desc(NES)) %>%
+    headtail(15, digits = 16) %>%
+  drop_na(pathway)
+
+#Visualize the results 
+ggplot(fgsea_res_filt_go,
+         aes(
+           x = fct_reorder(pathway, as.numeric(NES)),
+           y = as.numeric(NES)
+         )) +
+  coord_flip() +
+  theme_bw() +
+  labs(title = "IDH mut PC GSEA (FDR 0.01)", x = "", y = "NES") +
+  geom_col(aes(fill = as.numeric(padj))) +
+  theme(
+    axis.line = element_line(size = 0.8),
+    axis.line.y = element_blank(),
+    axis.text = element_text(size = 10, colour = "black"),
+    axis.title = element_text(size = 12),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.border = element_blank()
+  ) +
+  scale_fill_viridis_c() +
+  labs(fill = "p.adj") +
+  theme(
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    legend.text = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    plot.title = element_text(size = 10))
+
+```
+
+There is a clear enrichment in neurotransmitter-associated, vesicle-transport-associated and cellular-respiration-associated terms.
+
+### Hierarchical clustering of global protein expression data
+
+To investigate, whether different groups of samples are detectable for the protein expression data, I used a consensus-clustering-based hierarchical clustering by utilizing the spearman pairwise correlation based distance information for all the different samples. Running this in a consensus based fashion generates a robust grouping information. For a detailed information regarding consensus clustering, please refer to <https://link.springer.com/article/10.1023/A:1023949509487> and <https://pubmed.ncbi.nlm.nih.gov/20427518/>.
+
+```{r}
+library(ConsensusClusterPlus)
+
+df_lm <- log2(harmonize_df_parametric) %>%
+  filter(
+  	rowMeans(is.na(.)) < 0.5
+  	)
+
+#create matrix and perform proteinwise (row-wise) z-score transformation
+df_lm_sc <- rowScales(as.matrix(df_lm))
+
+#create distance matrix for pearson corr with pairwise complete observation
+dt = as.dist(
+	(1-cor(df_lm_sc, method="spearman", use = "pairwise.complete.obs")
+		)
+	)
+
+rcc2 = ConsensusClusterPlus(dt,
+                            seed = 42,
+                            maxK=8,
+                            reps=100,
+                            pItem=0.8,
+                            pFeature=1,
+                            title="title", #give it any title 
+                            innerLinkage="complete", 
+                            distance = "spearman", 
+                            finalLinkage="complete",
+                            clusterAlg="hc", 
+                            plot = "none" #set this to "pdf" if you want a pdf report
+                            )  
+#further identify CLC values 
+icl = calcICL(rcc2, 
+              title = "title", # set this to any title
+              plot = "none" #set this to "pdf" if you want a pdf report
+              )
+```
+
+Given the Consensus Matrix, the cummulative-distribution-function as well as the ellbow-cut-off of the relative change in the AUCDFC, I would further proceed with an optimal k of 5. Now, extract the clustering information for k=5 groups and visualize via heatmap.
+
+```{r}
+#| fig-cap: Spearman-distance-based hierarchical clustering of global protein expression data 
+#| fig-width: 6
+#| fig-height: 6
+
+cluster_df <- rcc2[[5]]$consensusClass %>%
+  as.data.frame() %>%
+  rownames_to_column("prot_id")
+
+colnames(cluster_df) <- c("prot_id", "cluster")
+
+#load package
+library(ComplexHeatmap)
+library(circlize)
+
+cohort_order <- t(df_lm_sc) %>%
+  as.data.frame() %>%
+  rownames_to_column("Prot_id") %>%
+  filter(Prot_id %in% df_meta$prot_id)
+
+
+#to be consistent, lets read in the meta data
+df_meta <- readRDS("20230215_df_meta_upd.rds") %>%
+  filter(prot_id %not_in% c( "_9_r1_1111", "_9_r1_1129", "_2_r1_2577"))
+
+df_meta <- df_meta %>%
+  dplyr::slice(match(cohort_order$Prot_id, prot_id)) %>%
+  separate(tmt_set_name_2, c("rm", "plex"), sep = "-", remove = FALSE)
+  # left_join(cluster_df, 
+  #           by = "prot_id")
+
+#define color space for creation of heatmap 
+color_fun_glio = colorRamp2(c(min(dt), 
+                              quantile(dt, 0.25),
+                              median(dt) , 
+                              quantile(dt, 0.75),
+                              max(dt)), 
+                            c("navyblue", #
+                                        "lightskyblue",
+                                        "white",
+                                        "red2",
+                                        "red4"))
+
+
+names(palette) <- unique(df_meta$plex)
+
+#create top annotation for heatmap
+coo_anno = HeatmapAnnotation(
+  IDH_status = df_meta[["idh_wt"]],
+  Cluster = df_meta[["cluster"]],
+  Plex = df_meta[["plex"]],
+  col = list(
+    IDH_status = c(
+    "mut" = "#e76f51",
+    "wt" = "#2a9d8f"
+    #NA = "grey"
+    ),
+    Cluster = c(
+      "1" = "#ef476f",
+      "2" = "#ffd166",
+      "3" = "#06d6a0",
+      "4" = "#118ab2", 
+      "5" = "#073b4c"
+    ),
+    Plex = palette
+))
+
+#plot heatmap with included hc and COO annotation
+ht <- Heatmap(as.matrix(dt),
+              col = color_fun_glio,
+              column_split = data.frame(df_meta$cluster),
+              row_split = 5,
+              column_title = " ",
+              row_title = " ",
+              border = F,
+              show_row_dend = FALSE,
+              #column_gap = unit(c(0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0), "mm"),
+              show_column_dend = FALSE,
+              cluster_rows = TRUE,
+              cluster_columns = TRUE,
+              show_column_names = FALSE,
+              show_row_names = FALSE,
+              top_annotation = coo_anno,
+              #bottom_annotation = clust_anno,
+              name = "distance") %>%
+  draw(heatmap_legend_side = "right", annotation_legend_side ="bottom", merge_legend = TRUE)
+```
+
+The top row annotates the IDH status and the second row highlights the proteomics data-inferred clusters. The heatmap below represents the distance from each sample to each other sample in the proteomics data space.
+
+Now check, whether the cluster assignment is driven by the plexes
+
+```{r}
+library(caret)
+library(broom)
+
+df_meta <- df_meta %>%
+  mutate(cluster = as.factor(cluster),
+         plex = as.factor(plex))
+
+df_meta_clust <- cbind(model.matrix(~ 0 + df_meta$cluster), df_meta$plex) %>%
+  as.data.frame()
+
+colnames(df_meta_clust) <- c("clust1", "clust2", "clust3", "clust4", "clust5",  "plex")
+
+output_df <- data.frame(cluster = as.character(),
+                        pval = as.numeric())
+
+for(i in 1:5) {
+  
+  output_inner_df <- data.frame(cluster = as.character(1),
+                        pval = as.numeric(1))
+  
+  output_inner_df$cluster <- colnames(df_meta_clust)[i]
+  
+  output_inner_df$pval <- (tidy(fisher.test(df_meta_clust[,i], df_meta_clust$plex, simulate.p.value = TRUE)))$p.value
+  
+  output_df <- rbind(output_df, output_inner_df)
+}
+
+output_final <- output_df %>% 
+  mutate(padj = p.adjust(pval, "BH"))
+
+library(knitr)
+kable(output_final)
+
+```
+
+So there is a statistical association of each cluster. Lets investigate this further
+
+```{r}
+library(fastDummies)
+library(ggcorrplot)
+
+df_meta_clust2 <- df_meta_clust %>%
+    fastDummies::dummy_cols(select_columns = "plex", remove_selected_columns = T)
+
+output_df <- data.frame(cluster = as.character(),
+                              plex = as.character(),
+                              pval = as.numeric())
+
+for(i in 1:5) {
+  
+  output_inner_df <- data.frame(cluster = as.character(),
+                                plex = as.character(),
+                        pval = as.numeric())
+  
+  plex_vec <- colnames(df_meta_clust2[-c(1:5)])
+  
+  for(j in plex_vec) {
+    
+    output_innest_df <- data.frame(cluster = as.character(1),
+                                   plex = as.character(1),
+                                   pval = as.numeric(1))
+    
+    output_innest_df$plex <- j
+    
+    output_innest_df$cluster <- colnames(df_meta_clust2)[i]
+  
+    output_innest_df$pval <- (tidy(fisher.test(df_meta_clust2[,i], df_meta_clust2[,j])))$p.value
+  
+    output_inner_df <- rbind(output_inner_df, output_innest_df)
+    
+  }
+  
+  output_df <- rbind(output_df, output_inner_df)
+
+}
+
+
+output_df <- output_df %>%
+  mutate(padj = p.adjust(pval, "BH")) %>%
+  dplyr::select(cluster, plex, padj) %>%
+  pivot_wider(names_from = "plex", values_from = "padj") %>%
+  column_to_rownames("cluster") %>%
+  as.matrix()
+
+color_fun_pval = colorRamp2(c(1,0.06, 0.05,min(output_df)),
+                            c("grey","white","lightskyblue","navyblue"))
+                                     
+
+ht <- Heatmap(as.matrix(t(output_df)),
+              col = color_fun_pval,
+              #row_split = 5,
+              column_title = " ",
+              row_title = " ",
+              border = F,
+              show_row_dend = FALSE,
+              #column_gap = unit(c(0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0), "mm"),
+              show_column_dend = FALSE,
+              cluster_rows = FALSE,
+              cluster_columns = FALSE,
+              show_column_names = TRUE,
+              show_row_names = TRUE,
+              #bottom_annotation = clust_anno,
+              name = "FDR") %>%
+  draw(heatmap_legend_side = "right", annotation_legend_side ="bottom", merge_legend = TRUE)
+  
+
+```
+
+### Cluster-wise gene-set enrichement analysis
+
+In a first step, it is necessary to identify differentially expressed features between the classes. To achieve this, I used the limma-based approach with providing the batch information I used for HarmonizR correction as a covariate.
+
+First, filter out all-NA columns
+
+```{r}
+threshold <- 0.999
+#filter dataset for proteins with less then 50% NA
+prot_limma <- left_join(df_prot[,c(1,2)],
+            df_wide_norm_upd, 
+            by = "uniprot_id") %>%
+  separate(gene_id, c("gene_id", "rem")) %>%
+  dplyr::select(-c("uniprot_id", "rem")) %>%
+  filter(rowMeans(is.na(.[,-c(1)])) < threshold)
+```
+
+Match the class df order to the proteome df order
+
+```{r}
+cohort_order <- prot_limma[,-c(1)] %>% t() %>% as.data.frame() %>% rownames_to_column("prot_id")
+df_meta <- df_meta %>%
+  dplyr::slice(match(cohort_order$prot_id, prot_id))
+```
+
+Create the identifiers for differential testing
+
+```{r}
+limma_ident <-  df_meta %>%
+  mutate(class = as.factor(cluster)) %>%
+  mutate(batch = case_when(
+    grepl("1097|1111|1129|1140|1150|1162|1177|1192", prot_id) ~ 2,
+    grepl("2572|2573", prot_id) ~ 3,
+    TRUE ~ 1
+  )) %>%
+  dplyr::select(prot_id, class, batch)
+  
+limma_df <- prot_limma
+```
+
+Set the annotations
+
+```{r}
+gene_ann <- dplyr::select(limma_df, gene_id)
+count_raw <- dplyr::select(limma_df, -gene_id)
+samples_ann <- limma_ident %>% dplyr::select(prot_id)
+```
+
+Create the model matrix and contrast
+
+```{r}
+library(limma)
+#create design matrix 
+modelmatrix <- model.matrix(~ 0 + limma_ident$class + limma_ident$batch)
+class_vec <- c("class_1" , "class_2" ,  "class_3" , "class_4" , "class_5", "batch")
+#rename the model matrix
+colnames(modelmatrix) <- class_vec
+contr_matrix_list <- list()
+contr_matrix_list[[1]]  <- makeContrasts(class_1 -((class_2 + class_3  + class_4 + class_5)/4),
+                              levels = modelmatrix)
+contr_matrix_list[[2]] <- makeContrasts(class_2 - ((class_1 + class_3  + class_4 + class_5)/4),
+                              levels = modelmatrix)
+contr_matrix_list[[3]] <- makeContrasts(class_3 - ((class_1 + class_2  + class_4 + class_5)/4),
+                              levels = modelmatrix)
+contr_matrix_list[[4]] <- makeContrasts(class_4 - ((class_1 + class_2  + class_3 + class_5)/4),
+                              levels = modelmatrix)
+contr_matrix_list[[5]] <- makeContrasts(class_5 - ((class_1 + class_2  + class_3 + class_4)/4),
+                              levels = modelmatrix)
+```
+
+Run the limma based differential testing
+
+```{r}
+output_df <- data.frame(#uniprot_id = as.character(),
+                        gene_id = as.character(),
+                        logFC = as.numeric(),
+                        AveExpr = as.numeric(),
+                        t = as.numeric(),
+                        P.Value= as.numeric(),
+                        adj.P.Val = as.numeric(),
+                        B = as.numeric(),
+                        class = as.character())
+for(i in 1:5) {
+  
+  prot_dge_design <- modelmatrix
+  # create EList for LIMMA
+  prot_elist <- list(
+    E = count_raw,
+    targets = samples_ann,
+    genes = gene_ann,
+    design = prot_dge_design
+  ) %>% new("EList", .)
+  
+  #fit model
+  prot_efit <- lmFit(prot_elist, design = modelmatrix)
+  
+  prot_efit <- contrasts.fit(prot_efit, contr_matrix_list[[i]])
+  # assuming that library size is more or less equal in a proteomics dataset, limma-trend is a viable approach
+  prot_efit <- eBayes(prot_efit, trend = T, robust = T)
+  
+  logFC_class <-
+    topTable(prot_efit,
+             adjust = "BH",
+             p.value = 1,
+             number = Inf) %>%
+    mutate(class = as.character(i))
+  
+  output_df <- rbind(output_df, logFC_class)
+}
+output_df <- output_df %>%
+  mutate(q_value = -log10(adj.P.Val)) %>%
+  mutate(signif = case_when(adj.P.Val < 0.01  ~ "sig", TRUE ~ "notsig")) %>%
+  mutate(sig_FC = case_when(signif == "sig" & logFC > 0.2 ~ "sig_fc",
+                            signif == "sig" & logFC < -0.2 ~ "sig_fc", 
+                            TRUE ~ "notsig_fc"))
+```
+
+Now, perform subsequent enrichment analysis for each using the fgsea package
+
+```{r}
+pathways_go <- gmtPathways("/Users/juliusenssle/Library/CloudStorage/OneDrive-JohannWolfgangGoetheUniversität/2021_DLBCL_proteogenomics/GSEA_gene_sets/c5.go.v7.4.symbols.gmt")
+
+results_df <- data.frame(
+  pathway = as.character(),
+  pval = as.numeric(), 
+  padj = as.numeric(), 
+  NES = as.numeric(),
+  size = as.numeric()
+)
+
+for(i in c(1:5)) {
+  output_filt <- output_df %>%
+    dplyr::filter(class == i)
+  
+  diff_exp_vec <- dplyr::select(output_filt, gene_id, t) %>%
+    drop_na(t) %>%
+    arrange(desc(t)) %>%
+    distinct(gene_id, .keep_all = TRUE) %>%
+    deframe()
+  
+  fgsea_res_go <-
+    fgseaMultilevel(
+      pathways = pathways_go,
+      stats = diff_exp_vec,
+      minSize = 15,
+      maxSize = 500
+    )
+  
+  fgsea_res_filt_go <-
+    fgsea_res_go  %>%
+    as_tibble() %>%
+    drop_na(padj) %>%
+    filter(padj <= 0.01) %>%
+    dplyr::select(pathway, pval, padj, NES, size) %>%
+    arrange(desc(NES)) %>%
+    headtail(10, digits = 16)
+  
+  results_df <- rbind(results_df, fgsea_res_filt_go)
+  
+  
+}
+# filter for unique pathway terms
+pathway_df <- results_df %>% distinct(pathway, .keep_all = TRUE) %>%
+  drop_na(pathway)
+```
+
+Now, lets compare the pathways that are found to be enriched in the differentially expressed features across the clusters. To achieve this, I performed a sample-wise gene-set-variation-analysis (GSVA, <https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-14-7>) for the pathways inferred above. This yields a pathway-score for each pathway of interest in each sample. The resulting samples x pathways matrix can then be used in a linear regression analysis with the sample's cluster-membership as regressors to determine the "mean-shift" of each pathway across all clusters. **GSVA** can only deal with complete data, hence I used the established and extensively benchmarked DreamAI imputation framework to impute missing values <https://github.com/WangLab-MSSM/DreamAI>
+
+```{r}
+#| fig-cap: Mean-shift GSVA scores of cluster-defining pathways
+#| fig-width: 14
+#| fig-height: 10
+
+library(GSVA)
+
+df_imp <- readRDS("20230106_imputed_df.rds") %>%
+  dplyr::select(-one_of(rm_vec)) %>%
+  rownames_to_column("uniprot_id")
+
+#generate final dataset
+df_prot_imp <- left_join(
+  df_prot[, c(1,2)] %>%
+    filter(uniprot_id %in% df_imp$uniprot_id), 
+  df_imp, 
+  by = "uniprot_id"
+) %>%
+  separate(gene_id, c("gene_id", "rm"), sep = ";") %>%
+  dplyr::select(-c("uniprot_id", "rm")) %>%
+  distinct(gene_id, .keep_all = TRUE) %>%
+  drop_na(gene_id) %>%
+  column_to_rownames("gene_id")
+
+#run gsva
+gsva.out <- GSVA::gsva(expr = as.matrix(df_prot_imp), 
+                       gset.idx.list = pathways_go[unique(results_df$pathway)], 
+                       method = "gsva",
+                       kcdf = "Gaussian",
+                       min.sz = 10,
+                       max.sz = 500,
+                       verbose = F) 
+
+#pivot longer for following kruskal wallis
+gsva_out_prot <- gsva.out %>% 
+  as_tibble(rownames = "Pathway") %>% 
+  pivot_longer(names_to = "prot_id", values_to="count", cols=c(-Pathway)) %>% 
+  left_join(df_meta %>% dplyr::select(prot_id, cluster), by= "prot_id") %>%
+  mutate(cluster = as.factor(cluster)) %>%
+  mutate(cluster_name = case_when(
+    cluster == "1" ~ "cluster_1",
+    cluster == "2" ~ "cluster_2",
+    cluster == "3" ~ "cluster_3",
+    cluster == "4" ~ "cluster_4",
+    cluster == "5" ~ "cluster_5"
+  ))
+
+#define kruskal.test function for significance test of differences between clusters
+kruskaltest <- function(set, pthw) {
+  out <- tryCatch(
+    {
+      kruskal.test(set[set$Pathway == pthw,]$count ~ set[set$Pathway == pthw,]$cluster)$p.value
+      
+    },
+    error = function(e)
+    {
+      return(NA)
+    }
+  )
+  return(out)
+}  
+
+#run rowwise kruskal test to identify significant differences of pathway scores over clusters
+gsva_out_prot_posthoc <- gsva_out_prot %>% 
+  distinct() %>%
+  rowwise() %>% 
+  mutate(pva = kruskaltest(gsva_out_prot, Pathway))
+
+# perform multiple testing adjustment
+gsva_out_prot_posthoc <- gsva_out_prot_posthoc %>% 
+  mutate(padj = p.adjust(pva, method = "BH"))
+
+#compare the mean shift 
+gsva_out_prot_meanshift <- gsva_out_prot %>% 
+  filter(Pathway %in% filter(gsva_out_prot_posthoc, padj < 0.01)$Pathway) %>% dplyr::select(Pathway, count, cluster) %>% 
+  fastDummies::dummy_cols(select_columns = "cluster", remove_selected_columns = T) %>%
+  group_by(Pathway) %>% 
+  do(
+    meanshift = lm(count ~ 0 + cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5, .)$coefficients)
+
+#generate the final matrix 
+gsva_out_prot_meanshift_mat <- gsva_out_prot_meanshift %>%   
+  unnest_wider(meanshift) %>% 
+  dplyr::select(-Pathway) %>% 
+  as.matrix() 
+
+prot_names <- rownames(gsva_out_prot_meanshift_mat)
+
+#create rownames 
+rownames(gsva_out_prot_meanshift_mat) <- gsva_out_prot_meanshift$Pathway %>% 
+  str_replace_all(pattern = "_", replacement = " ") %>%
+  str_replace_all(pattern = "GOBP ", replacement = "") %>%
+  str_replace_all(pattern = "GOCC ", replacement = "") %>%
+  str_replace_all(pattern = "GOMF ", replacement = "")%>%
+  str_replace_all(pattern = "HALLMARK ", replacement = "")
+
+gsva_out_prot_meanshift_mat_scaled <- gsva_out_prot_meanshift_mat %>% 
+  t() %>% 
+  scale() %>%
+  t()
+
+#create color frame for meanshift data 
+color_meanshift = colorRamp2(c(
+  min(gsva_out_prot_meanshift_mat_scaled),
+  median(gsva_out_prot_meanshift_mat_scaled),
+  max(gsva_out_prot_meanshift_mat_scaled)
+), c("blue", "white", "red"))
+
+#create cluster annotation
+cluster_anno = HeatmapAnnotation(
+  Class = c("1", "2", "3", "4", "5"),
+  col = list(
+    Class = c(
+     "1" = "#ef476f",
+      "2" = "#ffd166",
+      "3" = "#06d6a0",
+      "4" = "#118ab2", 
+      "5" = "#073b4c"
+    )
+  ),
+  annotation_label = c(" ")
+)
+
+#create heatmap object
+meanshift_proteome_ht <- Heatmap(gsva_out_prot_meanshift_mat_scaled,
+          show_column_names = FALSE,
+          show_row_names = T,
+          col = color_meanshift,
+          cluster_columns = FALSE, 
+          bottom_annotation = cluster_anno, 
+          name = "z-score", 
+          row_split = 6,
+          row_names_gp = gpar(fontsize = 10, face = "bold"),
+          width = unit(12, "cm"), 
+          row_title = " ")  %>%
+  draw(heatmap_legend_side = "left", merge_legend = TRUE)
+```
+
+Export data
+
+```{r}
+df_norm_uncorrected <- left_join(df_prot[,c(1,2)], 
+                     df_wide_norm_upd, 
+                     by = "uniprot_id") %>%
+  separate(uniprot_id, c("uniprot_id", "rm"), sep = ";") %>%
+  separate(gene_id, c("gene_id", "rm2"), sep = ";") %>%
+  dplyr::select(-c("rm", "rm2"))
+
+#transform to log2 
+df_norm_uncorrected[,-c(1,2)] <- log2(df_norm_uncorrected[,-c(1,2)])
+#save as csv
+write.csv(df_norm_uncorrected, "20230316_gioblastoma_proteome_norm_noBatchCorr.csv")
+
+
+
+df_norm_batch_corrected <- left_join(df_prot[,c(1,2)], 
+                     harmonize_df_parametric %>%
+                       rownames_to_column("uniprot_id"), 
+                     by = "uniprot_id") %>%
+  separate(uniprot_id, c("uniprot_id", "rm"), sep = ";") %>%
+  separate(gene_id, c("gene_id", "rm2"), sep = ";") %>%
+  dplyr::select(-c("rm", "rm2"))
+
+#transform to log2 
+df_norm_batch_corrected[,-c(1,2)] <- log2(df_norm_batch_corrected[,-c(1,2)])
+# save as csv
+write.csv(df_norm_batch_corrected, "20230316_gioblastoma_proteome_norm_withBatchCorr.csv")
+
+
+#export meta data 
+df_exp <- df_meta %>% 
+  dplyr::select(label, tmt_set_name_2, patient, proteomic_id, idh_wt, prot_id, cluster)
+
+#save as csv
+write.csv(df_exp, "20230316_glioblastoma_meta_data.csv")
+```
+
+There is an unclear situation of duplicated samples in the meta data
+
+```{r}
+df_meta_dupl <- df_meta %>%
+  dplyr::select(-rm) %>%
+  separate(patient, c("patient_id", "block"), sep = "-", remove = FALSE)
+
+dupl_vec <- 
+
+duplicated <- df_meta_dupl$patient_id[base::duplicated(df_meta_dupl$patient_id)] 
+
+dupl_meta <- df_meta_dupl %>%
+  filter(patient_id %in% duplicated) %>%
+  arrange(desc(patient))
+```
+
+### Session information
+
+```{r}
+sessionInfo()
+```
